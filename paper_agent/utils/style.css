@@ -1,0 +1,173 @@
+body {
+    background-color: #001f3f;
+    font-family: Arial, sans-serif;
+    text-align: center;
+}
+/* 设置整个 Gradio 容器的背景颜色和文字颜色 */
+.gradio-container {
+    background-color: #001f3f;
+    color: white;
+    font-family: Arial, sans-serif;
+    text-align: left;
+    padding: 0px;
+    width: 100%;
+    margin-left: 0;
+    margin-right: 0;
+}
+/* 强化 Markdown 文本颜色为白色 */
+.gradio-container .gradio-markdown * {
+    color: white !important;
+}
+
+/* 设置标题文本颜色为白色 */
+.gradio-container h1,
+.gradio-container h2,
+.gradio-container h3,
+.gradio-container h4,
+.gradio-container h5,
+.gradio-container h6,
+.gradio-container span,
+.gradio-container p,
+.gradio-container strong,
+.gradio-container textarea {
+    font-family: Arial, sans-serif;
+    color: white;
+}
+
+/* 设置group区域的背景颜色 */
+.gradio-container .gr-group {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+    padding: 10px;
+    border-radius: 4px;
+    margin: 5px;
+}
+.gradio-container .styler {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+}
+.gradio-container .ratio {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+}
+.gradio-container .svelte-k79vs1 {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+}
+.gradio-container .image-container {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+    padding: 10px;
+    border-radius: 4px;
+    margin: 5px;
+}
+/* 设置行区域的背景颜色 */
+.gradio-container .form {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+    padding: 10px;
+    border-radius: 4px;
+    margin: 5px;
+}
+.gradio-container .block{
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+}
+.gradio-container .block#component-6 {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+}
+.gradio-container .block#component-10 {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+    padding: 10px;
+    border-radius: 4px;
+    margin: 5px;
+}
+.gradio-container .block#component-16 {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+}
+
+/* 设置按钮的样式 */
+.gradio-container .row .lg {
+    background-color: #0074D9 !important;
+    color: white !important;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+    margin: 5px;
+}
+
+.gradio-container .gradio-button:hover {
+    background-color: #0074D9 !important;
+    color: white !important;
+}
+
+/* 设置图片容器的样式 */
+.gradio-container .gradio-image {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    padding: 10px;
+    border-radius: 4px;
+    margin-top: 20px;
+}
+
+
+/* 设置数据表表头的背景颜色和字体颜色 */
+.svelte-1xyl3gk thead th {
+    background-color: #636262; /* 表头深色背景 */
+    color: black !important; /* 表头白色字体 */
+    border: 1px solid white; /* 添加表头边框，颜色设为白色 */
+}
+
+/* 设置数据表单元格的样式 */
+.svelte-1xyl3gk td,
+.svelte-1xyl3gk th {
+    background-color: #918e8e; /* 表头深色背景 */
+    color: black !important; /* 表头白色字体 */
+    padding: 8px;
+    border: 1px solid white; /* 添加单元格边框，颜色设为白色 */
+}
+
+/* 关键CSS修正 */
+.gradio-container .mask {
+    position: fixed !important;
+    top: 5;
+    left: 0;
+    width: 100% !important;
+    height: 100% !important;
+    background: rgba(255, 255, 255, 0.1) !important;
+    color: white !important; /* 表头白色字体 */
+    z-index: 999;
+    display: flex !important;
+    justify-content: center;
+    align-items: center;
+    /* 初始隐藏 */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+
+/* .gradio-container .cell-wrap {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: white !important;
+    border-radius: 4px;
+    margin-top: 20px;
+} */
+
+/* 设置数据表表头的样式 */
+/* .gradio-container .table-wrap .table thead {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: white;
+    padding: 8px;
+} */
+
+/* 设置数据表单元格的样式 */
+/* .gradio-container .gradio-dataframe td {
+    padding: 8px;
+} */
+/* 设置数据表的样式
+
+
