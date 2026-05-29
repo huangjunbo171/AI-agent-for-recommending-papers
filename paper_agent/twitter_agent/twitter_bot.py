@@ -14,7 +14,7 @@ import pdb
 import requests
 import asyncio
 from dateutil.relativedelta import relativedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, quote
 from dateutil import parser
 from selenium.webdriver.common.action_chains import ActionChains
 # usage有 reply_comment comment transmit post
@@ -32,7 +32,10 @@ from datetime import datetime, timedelta
 # from generation import generation_post,generation_comment
 import pyperclip
 from http import HTTPStatus
-from twitter_agent.twitter_request import create_response
+try:
+    from twitter_agent.twitter_request import create_response
+except ModuleNotFoundError:
+    from twitter_request import create_response
 from datetime import datetime, timezone, timedelta
 class TwitterBot():
     def __init__(self, log_path: str = "./logs/twitter/twitter_log.log"):
@@ -46,156 +49,181 @@ class TwitterBot():
         无
         """
         super().__init__()
-        self.driver = WebDriver(log_path=log_path,use_proxy=True ,headless=True)   # ,headless=True
+        self.log_path = log_path
+        self.use_proxy = True
+        self.headless = True
+        self.driver = WebDriver(log_path=log_path,use_proxy=self.use_proxy ,headless=self.headless)   # ,headless=True
         self.log = logger(filename=log_path)
         self.database = sql_dataset('twitter')
-        
-        
-    async def login(self, url: str = "https://twitter.com/?lang=zh", account_id = None):
-        
-        "利用账号和密码登录，可能需要验证，用cookie登录用self.driver._login"
-        '''下一步优化是：只传入帐号id，然后去数据库查询获取帐号信息'''
+
+    def _driver_session_alive(self):
         try:
-            search_sql = f"SELECT * FROM accounts_info WHERE accounts_info.Account_id = {account_id}"
-            result = self.database.get_dict_data_sql(search_sql)[0]
-            self.log.info("从数据库中获取到的账号信息:{}".format(result))
-            account = result['Account']
-            password = result['Password']
-            email = result['Email']
-            email_password = result['Email_password']
-            cookies = result['Cookie']
-            FAcode = result['2FAcode']
-            token = result['Token']
-            avatar_url = result['Avatar_url']
-        except Exception as e:
-            self.log.error("获取账号信息失败，原因：{}".format(e))
-            raise Exception("获取账号信息失败")
+            _ = self.driver.driver.current_url
+            return True
+        except Exception:
+            return False
+
+    def _rebuild_driver(self):
         try:
-            if cookies:
-                cookies = json.loads(cookies)
+            self.driver.driver.quit()
+        except Exception:
+            pass
+        self.driver = WebDriver(
+            log_path=self.log_path,
+            use_proxy=self.use_proxy,
+            headless=self.headless,
+        )
+        self.log.info("webdriver 会话失活，已重建浏览器驱动")
 
-            # cookies = {}
-            # token = 'b4827951eab5c405e22440b52e3de6088da7407b'
-            # self.driver._login(url="https://x.com/home",token=token)
+    async def _ensure_live_driver(self, account_id=None, force_reset=False, url: str = "https://twitter.com/?lang=zh"):
+        if force_reset or not self._driver_session_alive():
+            self._rebuild_driver()
+            if account_id is not None:
+                await self.login_by_cookies(account_id=account_id, url=url)
+        
+    def _normalize_profile_url(self, url: str):
+        if not url:
+            return None
+        parsed = urlparse(url)
+        path = (parsed.path or "").rstrip("/").lower()
+        if not path:
+            return None
+        return f"x.com{path}"
 
-            self.driver._login(url="https://x.com/home",cookies=cookies,token=token)
-            time.sleep(random.uniform(15,30))
-            # pdb.set_trace()
+    def _profile_url_matches(self, actual_url: str, expected_url: str = None, account: str = None):
+        actual_norm = self._normalize_profile_url(actual_url)
+        expected_norm = self._normalize_profile_url(expected_url)
+        if actual_norm and expected_norm and actual_norm == expected_norm:
+            return True
 
-            #检查是否登录成功,是否包含帐号
-            self.handle_email_verify(email=email,email_password=email_password)
-            time.sleep(random.uniform(5,15))
-            self.driver.find_xpath(XPATH=f"//span[contains(text(), '{account}')]")
-            self.log.info("利用cookies或token登录成功")  
-            suspened = self.driver.find_xpaths(XPATH="//span[contains(text(), 'Your account is suspended')]")
-            if suspened:
-                self.log.info("账号被冻结了")
-                with open(f"./information/suspended_accounts.txt","a",encoding="utf-8") as file:
-                    file.write(result + "\n")
-                return
-            if not cookies:
-                new_cookies = json.dumps(self.driver.get_cookies(url="https://x.com/home"))
-                self.log.info("获取新cookies")
-                sql = '''UPDATE accounts_info SET Cookie = %s, Cookie_status = %s, Platform = %s,Latest_login_time = %s WHERE Account_id = %s;'''
-                self.database.operation(sql,(new_cookies,'在线','twitter',datetime.now(),account_id))
-                time.sleep(random.uniform(1,3))
-                self.log.info("更新数据库cookies成功")    
-            await self.get_user_profile(account_id=account_id)
-            time.sleep(2)
-            self.log.info(f'更新账号社交属性成功')
-            sql = '''UPDATE accounts_info SET Cookie_Status = %s WHERE Account_id = %s;'''
-            self.database.operation(sql,('在线',account_id))
+        actual_tail = (actual_norm or "").split("/")[-1]
+        expected_tail = (expected_norm or "").split("/")[-1]
+        account_tail = (account or "").lstrip("@").rstrip("/").lower()
+        return bool(actual_tail) and actual_tail in {expected_tail, account_tail}
 
-        except:
+    def _is_valid_profile_url(self, url: str):
+        if not url:
+            return False
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host not in {"x.com", "twitter.com"}:
+            return False
+        normalized = self._normalize_profile_url(url)
+        if not normalized:
+            return False
+        path = (parsed.path or "").strip("/")
+        if not path or "/" in path:
+            return False
+        tail = normalized.split("/")[-1]
+        reserved = {
+            "home",
+            "explore",
+            "search",
+            "notifications",
+            "messages",
+            "i",
+            "tos",
+            "privacy",
+            "settings",
+            "compose",
+            "login",
+            "logout",
+            "signup",
+            "intent",
+            "download",
+            "articles",
+            "press",
+            "brand-assets",
+            "help",
+            "about",
+            "business",
+            "support",
+        }
+        return tail not in reserved and "/" not in tail and len(tail) > 1
+
+    def _safe_get_text(self, xpath: str, default: str = ""):
+        try:
+            elements = self.driver.driver.find_elements(By.XPATH, xpath)
+        except Exception:
+            return default
+        for element in elements:
             try:
-                self.log.info("加载cookies登录失败，尝试账号密码登录")
-                self.driver.get(url)
-                self.log.info("进入推特")
-                time.sleep(random.uniform(8,15))
-                self.driver.search_and_click(XPATH="//a[@role = 'link' and @href = '/login']")
-                self.log.info("点击登录")
-                time.sleep(random.uniform(8,15))
-                self.driver.send_content(XPATH="//input[@name = 'text']", content = account)
-                self.log.info("输入账号")
-                time.sleep(random.uniform(2,4))
-                self.driver.search_and_click(XPATH="//span[contains(text(), '下一步')]", waiting_time=1.0)
-                self.log.info("点击下一步")
-                time.sleep(random.uniform(8,15))
-                try: 
-                    self.driver.find_xpath(XPATH="//input[@data-testid='ocfEnterTextTextInput']")
-                    self.log.info("出现验证，需要输入手机号/邮箱号验证")
-                    # self.driver.search_and_click(XPATH="//input[@data-testid='ocfEnterTextTextInput']", waiting_time=1.0)
-                    self.driver.send_content(XPATH="//input[@data-testid='ocfEnterTextTextInput']", content=email)
-                    self.log.info("点击下一步")
-                    self.driver.search_and_click(XPATH="//button[@data-testid='ocfEnterTextNextButton']", waiting_time=1.0)
-                except:
-                    self.log.info("不需要输入手机号/邮箱号验证")
-                self.driver.send_content(XPATH="//input[@type = 'password']", content = password)
-                self.log.info("输入密码")
-                time.sleep(random.uniform(2,4))
-                self.log.info("点击登录")
-                self.driver.search_and_click(XPATH="//span[contains(text(), '登录')]", waiting_time=3.0)
-                # try: 
-                #     self.driver.find_xpath(XPATH="//input[@data-testid='ocfEnterTextTextInput']")
-                #     self.log.info("需要输入手机号验证")
-                #     # self.driver.search_and_click(XPATH="//input[@data-testid='ocfEnterTextTextInput']", waiting_time=1.0)
-                #     self.driver.send_content(XPATH="//input[@data-testid='ocfEnterTextTextInput']", content=email)
-                #     self.log.info("点击下一步")
-                #     self.driver.search_and_click(XPATH="//button[@data-testid='ocfEnterTextNextButton']", waiting_time=1.0)
-                # except:
-                #     self.log.info("不需要输入手机号验证")
-                try:
-                    self.driver.find_xpath(XPATH="//input[@inputmode='numeric']")
-                    code = self.get_2FAcode(FAcode)
-                    time.sleep(random.uniform(2,4))
-                    self.driver.send_content(XPATH="//input[@inputmode='numeric']", content = code)
-                    self.log.info("输入2FA验证码:{}".format(code))
-                    self.driver.search_and_click(XPATH="//button[@data-testid='ocfEnterTextNextButton']", waiting_time=5.0)
-                except:
-                    self.log.info("不需要代码生成器生成验证码")
-                
-                self.handle_email_verify(email=email,email_password=email_password)
-                try:
-                    self.driver.find_xpath(XPATH="//span[contains(text(), 'Your account is suspended')]")
-                    self.log.info("账号被冻结了")
-                    with open(f"./information/suspended_accounts.txt","a",encoding="utf-8") as file:
-                        file.write(result + "\n")
-                    return
-                except:
-                    self.log.info("账号正常")
-                
-                try:
-                    time.sleep(random.uniform(2,4))
-                    #检查是否登录成功,是否包含帐号
-                    self.driver.find_xpath(XPATH=f"//span[contains(text(), '{account}')]")
-                    self.log.info("登录成功")
-                    suspened = self.driver.find_xpaths(XPATH="//span[contains(text(), 'Your account is suspended')]")
-                    if suspened:
-                        self.log.info("账号被冻结了")
-                        with open(f"./information/suspended_accounts.json","a",encoding="utf-8") as file:
-                            file.write(json.dumps(result,ensure_ascii=False)+ "\n")
-                        return
-                    new_cookies = json.dumps(self.driver.get_cookies(url="https://x.com/home"))
-                    self.log.info("获取新cookies")
+                text = (element.text or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
+        return default
 
-                    # 使用账号密码登录时，获取头像链接
-                    try:
-                        self.driver.get(url=f'https://x.com/{account}/photo')
-                        time.sleep(random.uniform(10, 20))
-                        avatar_url = self.driver.find_xpath(XPATH='//img[@alt="Image" and @class="css-9pa8cd"]').get_attribute('src')
-                    except:
-                        avatar_url = None
-                    sql = '''UPDATE accounts_info SET Avatar_url = %s, Cookie = %s, Cookie_status = %s, Platform = %s,Latest_login_time = %s WHERE Account_id = %s;'''
-                    self.database.operation(sql,(avatar_url,new_cookies,'在线','twitter',datetime.now(),account_id))
-                    time.sleep(random.uniform(1,3))
-                    await self.get_user_profile(account_id=account_id)
-                    time.sleep(2)
-                    self.log.info(f'更新账号社交属性成功')
-                    self.log.info("更新数据库cookies成功")
-                except Exception as e:
-                    self.log.error("更新数据库cookies失败，原因：{}".format(e))
-            except Exception as e:
-                self.log.error("登录失败，原因：{}".format(e))         
+    def _safe_get_attr(self, xpath: str, attribute: str, default: str = ""):
+        try:
+            elements = self.driver.driver.find_elements(By.XPATH, xpath)
+        except Exception:
+            return default
+        for element in elements:
+            try:
+                value = (element.get_attribute(attribute) or "").strip()
+            except Exception:
+                value = ""
+            if value:
+                return value
+        return default
+
+    def _extract_profile_href(self):
+        candidate_xpaths = [
+            '//a[@aria-label="Profile"]',
+            '//a[@data-testid="AppTabBar_Profile_Link"]',
+            '//button[@data-testid="SideNav_AccountSwitcher_Button"]//a',
+        ]
+        for xpath in candidate_xpaths:
+            try:
+                elements = self.driver.find_xpaths(XPATH=xpath)
+            except Exception:
+                elements = []
+            for element in elements:
+                try:
+                    href = element.get_attribute("href")
+                except Exception:
+                    href = None
+                if href and "x.com/" in href:
+                    return href
+        return None
+
+    def _cookie_login_state(self, expected_profile: str = None, account: str = None):
+        profile_href = self._extract_profile_href()
+        try:
+            current_url = self.driver.driver.current_url or ""
+        except Exception:
+            current_url = ""
+        normalized_current = current_url.rstrip("/").lower()
+
+        logged_in_markers = [
+            '//button[@data-testid="SideNav_AccountSwitcher_Button"]',
+            '//a[@data-testid="AppTabBar_Home_Link"]',
+            '//a[@href="/compose/post"]',
+            '//div[@data-testid="primaryColumn"]',
+        ]
+        has_logged_in_ui = any(self.driver.find_xpaths(XPATH=xpath) for xpath in logged_in_markers)
+        has_login_form = bool(self.driver.find_xpaths(XPATH='//input[@name="text"]')) or bool(
+            self.driver.find_xpaths(XPATH='//a[contains(@href,"/i/flow/login")]')
+        )
+
+        if profile_href and self._profile_url_matches(profile_href, expected_profile, account):
+            return True, profile_href, current_url
+        if not expected_profile and profile_href:
+            return True, profile_href, current_url
+        if has_logged_in_ui and not has_login_form and ("/home" in normalized_current or normalized_current in {"https://x.com", "https://twitter.com"}):
+            return True, profile_href, current_url
+        if expected_profile and not has_login_form and self._profile_url_matches(current_url, expected_profile, account):
+            return True, profile_href, current_url
+        return False, profile_href, current_url
+        
+        
+    async def login(self, url: str = "https://twitter.com/?lang=zh", account_id=None):
+        "仅允许 cookie 登录，避免回退到账号密码流程"
+        return await self.login_by_cookies(account_id=account_id, url=url)
     
     
     def get_2FAcode(self,FAcode):
@@ -268,8 +296,10 @@ class TwitterBot():
             time.sleep(random.uniform(5,8))
             # 刷新页面
             # 检查是否登录成功，是否包含账号
-            href = self.driver.find_xpaths(XPATH='//a[@aria-label="Profile"]')[-1].get_attribute("href")
-            if profile and href != profile:
+            href_candidates = self.driver.find_xpaths(XPATH='//a[@aria-label="Profile"]')
+            href = href_candidates[-1].get_attribute("href") if href_candidates else None
+            login_ok = self._cookie_login_state(expected_profile=profile, account=account)[0]
+            if profile and href and not self._profile_url_matches(href, profile, account) and not login_ok:
                 self.log.info(f"数据库中的主页链接为{profile}，当前的主页链接为{href}，不一致")
                 sql = '''UPDATE accounts_info SET Cookie_Status = %s WHERE Account_id = %s;'''
                 self.database.operation(sql,('下线',account_id))
@@ -448,7 +478,7 @@ class TwitterBot():
             self.driver.get(url)
             time.sleep(random.uniform(5,8))
             data = {"帐号昵称":None,"账号描述":None,"粉丝数":None,"关注数":None,"加入twitter的时间":None,"所在地":None,"帖子数":None,"头像链接":None}
-            user_profile = self.get_user_pagehome(url)
+            user_profile = self.get_user_pagehome_safe(url)
             data["帐号昵称"] = user_profile["nickname"]
             data["账号描述"] = user_profile["user_description"]
             data["粉丝数"] = user_profile["followers_num"]
@@ -456,7 +486,7 @@ class TwitterBot():
             data["加入twitter的时间"] = user_profile["user_join_date"]
             data["所在地"] = user_profile["user_location"]
             data["帖子数"] = user_profile["posts_num"]
-            data["头像链接"] = user_profile["avatar_url"]
+            data["头像链接"] = user_profile["avatar_url"] or ""
   
             self.log.info(f"获取的用户信息为：{data}")
             # 更新属性表
@@ -478,6 +508,92 @@ class TwitterBot():
             return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}获取主页信息失败')
     
     
+    def get_user_pagehome_safe(self, url: str = None):
+        "Get user profile info from X profile page without noisy XPath errors."
+        self.driver.get(url=url)
+        time.sleep(random.uniform(10, 20))
+
+        nickname = url.split('/')[-1] if url else ""
+        user_description = ""
+        user_location = ""
+        user_join_date = ""
+        following_num = ""
+        followers_num = ""
+        posts_num = ""
+        avatar_url = ""
+
+        try:
+            elements = self.driver.driver.find_elements(By.XPATH, '//div[@data-testid="UserName"]//span')
+            for element in elements:
+                text = (element.text or "").strip()
+                if text:
+                    nickname = text
+                    break
+        except Exception:
+            pass
+
+        try:
+            elements = self.driver.driver.find_elements(By.XPATH, '//div[@data-testid="UserDescription"]')
+            for element in elements:
+                text = (element.text or "").strip()
+                if text:
+                    user_description = text
+                    break
+        except Exception:
+            pass
+
+        try:
+            elements = self.driver.driver.find_elements(By.XPATH, '//span[@data-testid="UserLocation"]')
+            for element in elements:
+                text = (element.text or "").strip()
+                if text:
+                    user_location = text
+                    break
+        except Exception:
+            pass
+
+        try:
+            elements = self.driver.driver.find_elements(By.XPATH, '//span[@data-testid="UserJoinDate"]')
+            for element in elements:
+                text = (element.text or "").strip()
+                if text:
+                    user_join_date = text
+                    break
+        except Exception:
+            pass
+
+        try:
+            script_elem = self.driver.driver.find_element(By.CSS_SELECTOR, 'script[type="application/ld+json"][data-testid="UserProfileSchema-test"]')
+            json_text = script_elem.get_attribute("innerHTML")
+            data = json.loads(json_text)
+            stats = data["mainEntity"]["interactionStatistic"]
+            followers_num = str(stats[0].get("userInteractionCount", 0))
+            following_num = str(stats[1].get("userInteractionCount", 0))
+            posts_num = str(stats[2].get("userInteractionCount", 0))
+        except Exception:
+            pass
+
+        try:
+            self.driver.get(url=f'{url}/photo')
+            time.sleep(random.uniform(10, 20))
+            elements = self.driver.driver.find_elements(By.XPATH, '//img[@alt="Image"]')
+            if elements:
+                avatar_url = (elements[0].get_attribute('src') or "").strip()
+        except Exception:
+            pass
+
+        return {
+            'nickname': nickname,
+            'url': url,
+            'user_description': user_description,
+            'user_location': user_location,
+            'user_join_date': user_join_date,
+            'following_num': following_num,
+            'followers_num': followers_num,
+            'posts_num': posts_num,
+            "avatar_url": avatar_url,
+        }
+
     def get_user_pagehome(self, url: str = None):
         "获取用户主页简介信息,url为用户主页链接"
         self.driver.get(url=url)
@@ -620,11 +736,12 @@ class TwitterBot():
             return None
      
      
-    async def get_one_content(self,url:str=None):
+    async def get_one_content(self,url:str=None, account_id=None, retry_on_reset=True):
         '''获取某贴文的具体信息'''
         data = {"nickname":'',"user_url":'',"note_url":'',"note_form":'',"note_type":'',"post_time_ip":'',"title":'', "content":'', "transmits":'',"views":'',"comments":'',"bookmarks":'',"likes":'',"images_url":[]}
         
         try:
+            await self._ensure_live_driver(account_id=account_id)
             if url:
                 # data["note_url"] = url
                 self.log.info(f'进入网址：{url}获取笔记具体内容')
@@ -693,6 +810,10 @@ class TwitterBot():
         
         except Exception as e:
             self.log.error(f'爬取twitter内容失败，原因是：{e}')
+            if retry_on_reset and not self._driver_session_alive():
+                self.log.info('检测到 webdriver 会话失活，重建后重试当前帖子抓取')
+                await self._ensure_live_driver(account_id=account_id, force_reset=True)
+                return await self.get_one_content(url=url, account_id=account_id, retry_on_reset=False)
             if url:
                await self.close_now_windows()
             return {}  
@@ -1130,8 +1251,89 @@ class TwitterBot():
             action_time = datetime.now()
             self.driver.get(url="https://x.com/explore/tabs/trending")
             self.log.info("进入热榜页面")
-            time.sleep(random.uniform(5,10))
-            hotwords_list = self.driver.search_and_get_all_content(xpath='//div[@class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-b88u0q r-1bymd8e"]')
+            time.sleep(random.uniform(6,10))
+
+            candidate_xpaths = [
+                '//div[@data-testid="trend"]//span',
+                '//section[contains(@aria-labelledby, "accessible-list")]//div[@data-testid="trend"]//span',
+                '//div[@aria-label="Timeline: Explore"]//div[@data-testid="cellInnerDiv"]//span',
+                '//div[contains(@class,"css-146c3p1") and contains(@class,"r-bcqeeo") and contains(@class,"r-qvutc0")]',
+            ]
+
+            ignored_keywords = {
+                "what's happening",
+                "trending",
+                "show more",
+                "what’s happening",
+                "for you",
+                "news",
+                "sports",
+                "entertainment",
+            }
+            hotwords_list = []
+            seen = set()
+
+            for xpath in candidate_xpaths:
+                try:
+                    elements = self.driver.find_xpaths(XPATH=xpath)
+                except Exception:
+                    elements = []
+                for element in elements:
+                    try:
+                        text = (element.text or "").strip()
+                    except Exception:
+                        text = ""
+                    if not text:
+                        continue
+                    normalized = " ".join(text.split()).strip()
+                    if "\n" in text:
+                        normalized = text.splitlines()[-1].strip() or normalized
+                    lowered = normalized.lower()
+                    if lowered in ignored_keywords:
+                        continue
+                    if len(normalized) <= 1 or len(normalized) > 80:
+                        continue
+                    if normalized.startswith(("·", "Promoted", "LIVE")):
+                        continue
+                    if lowered in seen:
+                        continue
+                    seen.add(lowered)
+                    hotwords_list.append(normalized)
+                if len(hotwords_list) >= 10:
+                    break
+
+            if len(hotwords_list) < 5:
+                for _ in range(2):
+                    self.driver.scroll(size=1200)
+                    time.sleep(random.uniform(2,4))
+                    for xpath in candidate_xpaths:
+                        try:
+                            elements = self.driver.find_xpaths(XPATH=xpath)
+                        except Exception:
+                            elements = []
+                        for element in elements:
+                            try:
+                                text = (element.text or "").strip()
+                            except Exception:
+                                text = ""
+                            if not text:
+                                continue
+                            normalized = " ".join(text.split()).strip()
+                            if "\n" in text:
+                                normalized = text.splitlines()[-1].strip() or normalized
+                            lowered = normalized.lower()
+                            if lowered in ignored_keywords or len(normalized) <= 1 or len(normalized) > 80:
+                                continue
+                            if normalized.startswith(("·", "Promoted", "LIVE")) or lowered in seen:
+                                continue
+                            seen.add(lowered)
+                            hotwords_list.append(normalized)
+                        if len(hotwords_list) >= 10:
+                            break
+                    if len(hotwords_list) >= 10:
+                        break
+
+            hotwords_list = hotwords_list[:20]
             self.log.info(f'账号{account_id}获取到的twitter热搜词共：{len(hotwords_list)}个,分别是“{hotwords_list}')        
             # 存到交互表中
             now_time = datetime.now()
@@ -1728,37 +1930,76 @@ class TwitterBot():
             os.makedirs(f'./information/followings/{nickname}',exist_ok=True)
             save_path = f'./information/followings/{nickname}/{type}.txt'
     
-        following_element = self.driver.find_xpath(XPATH='//div[@class="css-175oi2r" and @data-testid="cellInnerDiv"]')
         try:
-            while True:
-                try:
-                    user_url = following_element.find_element(By.XPATH, './/a[@role="link"]').get_attribute("href")
-                    self.log.info("当前获取关注用户/粉丝用户为：{}".format(user_url))
-                except:
-                    return results
-                
-                if os.path.exists(save_path):
-                    # 读取txt文件，避免重复
-                    with open(save_path, "r", encoding="utf-8") as file:
-                        exit_results = file.readlines()  
-                        exit_results = [result.strip() for result in results]  # 去除每行末尾的换行符
-                    if user_url not in exit_results:
-                        results.append(user_url)
-                        with open(save_path,"a",encoding="utf-8") as file:
-                            file.write(user_url + "\n")
-                else: # 直接写入
+            existing_results = set()
+            if os.path.exists(save_path):
+                with open(save_path, "r", encoding="utf-8") as file:
+                    existing_results = {line.strip() for line in file if line.strip()}
+
+            seen_rounds = 0
+            max_rounds = 12
+            while seen_rounds < max_rounds:
+                user_cells = []
+                cell_xpaths = [
+                    '//div[@data-testid="cellInnerDiv"][.//span[starts-with(text(),"@")]]',
+                    '//div[@data-testid="cellInnerDiv"][.//a[contains(@href,"/") and .//span[starts-with(text(),"@")]]]',
+                    '//div[@data-testid="UserCell"]',
+                ]
+                for cell_xpath in cell_xpaths:
+                    user_cells = self.driver.find_xpaths(XPATH=cell_xpath)
+                    if user_cells:
+                        break
+                before_count = len(existing_results)
+
+                if not user_cells and seen_rounds == 0:
+                    current_url = ""
+                    try:
+                        current_url = self.driver.driver.current_url
+                    except Exception:
+                        pass
+                    self.log.info(f"关注页未找到用户卡片，current_url={current_url}")
+
+                for cell in user_cells:
+                    anchors = []
+                    try:
+                        anchors = cell.find_elements(By.XPATH, './/a[@role="link" and contains(@href,"/")]')
+                    except Exception:
+                        anchors = []
+
+                    user_url = ""
+                    for anchor in anchors:
+                        try:
+                            candidate_url = (anchor.get_attribute("href") or "").strip()
+                        except Exception:
+                            candidate_url = ""
+                        if not self._is_valid_profile_url(candidate_url):
+                            continue
+                        user_url = candidate_url
+                        break
+
+                    if not user_url:
+                        continue
+                    if user_url in existing_results:
+                        continue
+                    existing_results.add(user_url)
                     results.append(user_url)
-                    with open(save_path,"a",encoding="utf-8") as file:
+                    self.log.info("当前获取关注用户/粉丝用户为：{}".format(user_url))
+                    with open(save_path, "a", encoding="utf-8") as file:
                         file.write(user_url + "\n")
-                following_element =  following_element.find_element(By.XPATH,'following-sibling::div[@class="css-175oi2r" and @data-testid="cellInnerDiv"]')
-                self.driver.scroll(size=following_element.size['height'])
+
+                if len(existing_results) == before_count:
+                    seen_rounds += 1
+                else:
+                    seen_rounds = 0
+
+                self.driver.scroll(size=1200)
                 time.sleep(random.uniform(2,4))
-                if self.driver.judge_bottom():
-                    self.log.info("已滚动到页面底部")
-                    return results
+
+            self.log.info("关注/粉丝列表抓取结束")
+            return list(existing_results)
         except Exception as e:
             self.log.error(f"获取用户粉丝/关注列表失败:{e}")
-            return results 
+            return list(set(results)) 
 
 
    
@@ -2523,18 +2764,174 @@ class TwitterBot():
             return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'获取通知信息失败,原因是：{e}')
 
 
-    async def get_one_keyword_content(self,account_id,keyword:str=None,article=None):
+    def _find_notification_articles(self):
+        timeline_xpaths = [
+            '//div[@aria-label="Timeline: Notifications"]',
+            '//section[.//span[contains(text(),"Notifications")]]',
+            '//main',
+        ]
+        article_xpaths = [
+            './/div[@data-testid="cellInnerDiv"][.//article]',
+            './/article/ancestor::div[@data-testid="cellInnerDiv"][1]',
+        ]
+
+        for timeline_xpath in timeline_xpaths:
+            try:
+                timelines = self.driver.driver.find_elements(By.XPATH, timeline_xpath)
+            except Exception:
+                timelines = []
+            for timeline in timelines:
+                for article_xpath in article_xpaths:
+                    try:
+                        articles = timeline.find_elements(By.XPATH, article_xpath)
+                    except Exception:
+                        articles = []
+                    if articles:
+                        return articles
+
+        for article_xpath in [
+            '//div[@data-testid="cellInnerDiv"][.//article]',
+            '//article/ancestor::div[@data-testid="cellInnerDiv"][1]',
+        ]:
+            try:
+                articles = self.driver.driver.find_elements(By.XPATH, article_xpath)
+            except Exception:
+                articles = []
+            if articles:
+                return articles
+        return []
+
+    async def _open_notifications_page(self):
+        self.driver.get(url='https://x.com/notifications')
+        await asyncio.sleep(random.uniform(5,8))
+
+    async def _return_from_notification_detail(self):
+        back_xpaths = [
+            '//button[@data-testid="app-bar-back"]',
+            '//button[@aria-label="Back"]',
+            '//header//button',
+        ]
+        for xpath in back_xpaths:
+            try:
+                buttons = self.driver.driver.find_elements(By.XPATH, xpath)
+            except Exception:
+                buttons = []
+            for button in buttons:
+                try:
+                    button.click()
+                    await asyncio.sleep(random.uniform(2,4))
+                    return
+                except Exception:
+                    continue
+
+        try:
+            self.driver.driver.back()
+        except Exception:
+            self.driver.get(url='https://x.com/notifications')
+        await asyncio.sleep(random.uniform(3,5))
+
+    def _insert_notification_row(self, account_id, notify_time, notify_info):
+        insert_sql = '''INSERT INTO `twitter_notification`(`Account_id`,`Platform`,`Notify_Time`,`Notify_Type`,`Comment_Content`,`Comment_URL`,`Actor_URL`,`Original_Note_URL`,`Original_Content`,`Update_Time`) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);'''
+        actors = notify_info.get('actors_url') or []
+        actor_url = actors[0] if actors else ''
+        self.database.operation(
+            insert_sql,
+            (
+                account_id,
+                'twitter',
+                notify_time,
+                notify_info.get('notify_type', ''),
+                notify_info.get('content', ''),
+                notify_info.get('note_url', ''),
+                actor_url,
+                notify_info.get('original_url', ''),
+                notify_info.get('original_content', ''),
+                datetime.now(),
+            ),
+        )
+
+    async def get_notifications(self,account_id,time_limit):
+        create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if 'https://x.com' not in self.driver.driver.current_url:
+            await self.login_by_cookies(account_id=account_id)
+
+        if isinstance(time_limit, str):
+            notification_start_time = self.parse_time_string(time_string=time_limit)
+        elif isinstance(time_limit, datetime):
+            notification_start_time = time_limit
+        else:
+            notification_start_time = datetime.now() - timedelta(days=7)
+
+        notify_informations = []
+
+        try:
+            action_time = datetime.now()
+            await self._open_notifications_page()
+            articles = self._find_notification_articles()
+            if not articles:
+                self.log.info('未找到通知列表，按无新通知处理')
+                return create_response(create_time=create_time,code=HTTPStatus.OK,message='success',response=notify_informations)
+
+            index = 0
+            while True:
+                articles = self._find_notification_articles()
+                if index >= len(articles):
+                    break
+
+                article = articles[index]
+                try:
+                    self.driver.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", article)
+                except Exception:
+                    pass
+                await asyncio.sleep(random.uniform(1,3))
+
+                try:
+                    notify_time_raw = article.find_element(By.TAG_NAME,'time').get_attribute('datetime')
+                except Exception:
+                    index += 1
+                    continue
+
+                notify_time = await self.covert_ustime_to_china(notify_time_raw)
+                if notify_time < notification_start_time:
+                    self.log.info(f'通知时间早于 {time_limit}，停止继续抓取通知')
+                    break
+
+                notification_information = await self.get_notifications_details(account_id=account_id,article=article)
+                if notification_information:
+                    self.log.info(f'获取到的通知内容是：{notification_information}')
+                    for notify_info in notification_information:
+                        self._insert_notification_row(account_id=account_id, notify_time=notify_time, notify_info=notify_info)
+                        self.log.info(f'{notify_info} 已更新到数据库twitter通知表')
+                    notify_informations.extend(notification_information)
+                else:
+                    self.log.info('该通知属于关注/广告或无有效内容，跳过')
+
+                await self._return_from_notification_detail()
+                index += 1
+
+            insert_sql = '''INSERT INTO `twitter_interaction`(`Account_id`,`Platform`,`Action`,`Interaction_time`,`Result_list`,`Update_time`) VALUES(%s,%s,%s,%s,%s,%s);'''
+            self.database.operation(insert_sql,(account_id,'twitter','查看通知',action_time,str(notify_informations),datetime.now()))
+            self.log.info('查看通知 已更新到数据库twitter互动表')
+            return create_response(create_time=create_time,code=HTTPStatus.OK,message='success',response=notify_informations)
+
+        except Exception as e:
+            self.log.error(f'获取通知信息失败，失败原因是：{e}')
+            return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'获取通知信息失败,原因是：{e}')
+
+    async def get_one_keyword_content(self,account_id,keyword:str=None,article=None,retry_on_reset=True):
         '''获取一个贴文的内容 不关闭窗口，然后返回。'''
         create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
+            await self._ensure_live_driver(account_id=account_id)
             
             if 'https://x.com' not in self.driver.driver.current_url:
                 await self.login_by_cookies(account_id=account_id)
     
-            url = f'''https://twitter.com/search?q="{keyword}"&src=typed_query&f=live'''  # 选择 Latest
+            encoded_keyword = quote(f'"{keyword}"', safe="")
+            url = f'https://twitter.com/search?q={encoded_keyword}&src=typed_query&f=live'
             # 重定向网址
-            final1 = requests.get(self.driver.driver.current_url, allow_redirects=True).url
-            final2 = requests.get(url, allow_redirects=True).url
+            final1 = (self.driver.driver.current_url or "").replace("twitter.com", "x.com").rstrip("/")
+            final2 = url.replace("twitter.com", "x.com").rstrip("/")
 
             if final1 != final2:
                 self.log.info(f'进入网页：{url}')   
@@ -2544,17 +2941,58 @@ class TwitterBot():
             # article 元素是否存在
             if not article:
                 try:
-                    article = self.driver.find_xpath(XPATH='//div[@class="css-175oi2r" and @data-testid="cellInnerDiv" and .//article]')
+                    candidate_xpaths = [
+                        '//div[@data-testid="cellInnerDiv"][.//article]',
+                        '//article/ancestor::div[@data-testid="cellInnerDiv"][1]',
+                        '//div[@aria-label="Timeline: Search timeline"]//div[@data-testid="cellInnerDiv"][.//article]',
+                        '//div[@data-testid="primaryColumn"]//article/ancestor::div[@data-testid="cellInnerDiv"][1]',
+                    ]
+                    article = None
+                    for xpath in candidate_xpaths:
+                        articles = self.driver.find_xpaths(XPATH=xpath)
+                        if articles:
+                            article = articles[0]
+                            break
+                    if not article:
+                        raise ValueError("no search results")
                 except:
                     self.log.info(f'未找到任何的相关内容，返回')
                     return {},None
             else:
-                article = article.find_element(By.XPATH,'following-sibling::div[@class="css-175oi2r" and @data-testid="cellInnerDiv" and .//article]')
+                next_xpaths = [
+                    'following-sibling::div[@data-testid="cellInnerDiv"][.//article]',
+                    'following-sibling::article/ancestor::div[@data-testid="cellInnerDiv"][1]',
+                ]
+                found = None
+                for xpath in next_xpaths:
+                    try:
+                        found = article.find_element(By.XPATH, xpath)
+                        break
+                    except Exception:
+                        continue
+                if not found:
+                    self.log.info(f'未找到任何的相关内容，返回')
+                    return {}, None
+                article = found
 
             self.driver.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", article)
             time.sleep(random.uniform(2,4))
 
-            article_url = article.find_element(By.XPATH,'.//a[contains(@class,"css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 ") and contains(@href,"/status/")]').get_attribute("href")
+            article_url = None
+            article_url_xpaths = [
+                './/a[contains(@href,"/status/")][.//time]',
+                './/a[contains(@href,"/status/")]',
+            ]
+            for xpath in article_url_xpaths:
+                try:
+                    article_url = article.find_element(By.XPATH, xpath).get_attribute("href")
+                    if article_url:
+                        break
+                except Exception:
+                    continue
+            if not article_url:
+                self.log.info(f'未找到任何的相关内容，返回')
+                return {}, None
         
             # try:
             #     article.find_element(By.XPATH,'.//div[contains(text(),"Replying to ")]')
@@ -2567,7 +3005,7 @@ class TwitterBot():
             self.driver.open_new_tab(url=article_url)
             time.sleep(random.uniform(10,15))
             self.driver.swith_to_new_window(id=-1)
-            data = await self.get_one_content()
+            data = await self.get_one_content(account_id=account_id)
             data["keyword"] = keyword
             # data['tweet_type'] = tweet_type
             self.log.info(f'搜索热搜词{keyword}获取的曝光内容是:{data}')
@@ -2581,15 +3019,28 @@ class TwitterBot():
 
         except Exception as e:
             self.log.error(f'获取关键词内容失败，失败原因是：{e}')
+            if retry_on_reset and not self._driver_session_alive():
+                self.log.info(f'账号{account_id}的 webdriver 会话失活，重建后重试关键词 {keyword}')
+                await self._ensure_live_driver(account_id=account_id, force_reset=True)
+                return await self.get_one_keyword_content(account_id=account_id, keyword=keyword, article=None, retry_on_reset=False)
             return {},None
         
 # 建立一个数据表 ，存档跟踪回复的结果
 
     async def close_now_windows(self):
         await asyncio.sleep(random.uniform(1,4))
-        self.driver.close()
+        try:
+            handles = self.driver.driver.window_handles
+        except Exception:
+            handles = []
+        if len(handles) > 1:
+            self.driver.close()
         await asyncio.sleep(random.uniform(2,5))
-        self.driver.swith_to_new_window(id=-1)
+        if handles:
+            try:
+                self.driver.swith_to_new_window(id=-1)
+            except Exception:
+                pass
         await asyncio.sleep(random.uniform(2,5))
 
 

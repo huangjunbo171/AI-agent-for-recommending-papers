@@ -5,7 +5,10 @@ sys.path.insert(0,pythonpath)
 
 
 from fastapi import HTTPException
-from twitter_agent.twitter_request import *
+try:
+    from twitter_agent.twitter_request import *
+except ModuleNotFoundError:
+    from twitter_request import *
 
 
 # def validata_base_fields(request):

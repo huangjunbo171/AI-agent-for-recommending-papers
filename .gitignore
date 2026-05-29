@@ -1,0 +1,23 @@
+# Local secrets and runtime configuration
+paper_agent/config.py
+.env
+.env.*
+
+# Runtime outputs
+logs/
+information/
+paper_agent/logs/
+paper_agent/information/
+QRcode/
+papers/extracted/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Local database dumps and generated helpers
+twitter_database.sql
+generate_2fa_code.py

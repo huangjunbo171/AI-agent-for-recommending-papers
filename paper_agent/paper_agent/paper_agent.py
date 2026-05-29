@@ -25,7 +25,10 @@ from paper_agent.scrap_objects import ScrapObjects
 import schedule
 import multiprocessing
 import asyncio
-from prompts_test import *
+try:
+    from paper_agent.prompts_test import *
+except ModuleNotFoundError:
+    from prompts_test import *
 from xhs_agent.xhs_bot import XiaohongshuBot
 from xhs_agent.xhs_planner import XiaohongshuPlanner
 # 构造platform和bot的映射
@@ -63,6 +66,14 @@ class PaperAgent():
             self.auto_post=True # 主动发帖
 
         self.action_alias = {"仅评论": "评论","仅转发": "转发"}  # 动作别称
+
+    def _force_run_now_enabled(self):
+        return os.environ.get("FORCE_RUN_NOW") == "1"
+
+    def _runtime_limit_reached(self, start_ts, max_runtime_minutes):
+        if max_runtime_minutes is None:
+            return False
+        return (time.monotonic() - start_ts) >= max_runtime_minutes * 60
 
     def format_action_time(self, action_times):
         """将{"id":[time]}转换为{"time":[id]}"""
@@ -143,7 +154,7 @@ class PaperAgent():
 
 
     # 多个账号串行执行操作,串行运营同一领域 的 多个账号
-    async def auto_cultivation(self,account_ids:list,domain:str=None,paper_path=None):
+    async def auto_cultivation(self,account_ids:list,domain:str=None,paper_path=None,max_cycles=None,max_runtime_minutes=None):
         '''
         account_ids:要运营的账号
         domain: 目标领域
@@ -156,6 +167,10 @@ class PaperAgent():
         
 
         self.log.info(f'''开始培育账号:{account_ids}''')
+        if self._force_run_now_enabled() and max_cycles is None:
+            max_cycles = 1
+        start_ts = time.monotonic()
+        completed_cycles = 0
 
         # 每个账号要获取的 最新一条通知 的时间
         time_limit = convert_time_us(datetime.now()- timedelta(days=1)) # 第一次，获取3天前的通知
@@ -163,6 +178,12 @@ class PaperAgent():
         self.log.info(f'账号的通知时间是：{accounts_notify_time}')
 
         while True:
+            if self._runtime_limit_reached(start_ts, max_runtime_minutes):
+                self.log.info(f'已达到最大运行时长 {max_runtime_minutes} 分钟，自动退出')
+                break
+            if max_cycles is not None and completed_cycles >= max_cycles:
+                self.log.info(f'已达到最大运行轮次 {max_cycles}，自动退出')
+                break
             # 确认每个账号的操作时间是否过期
             for account_id in account_ids:
                 search_sql = f"SELECT * FROM accounts_info WHERE accounts_info.Account_id = {account_id}"
@@ -186,10 +207,20 @@ class PaperAgent():
             self.log.info(f"规范化后的账号时间为：{accounts_time}") 
             
             while True:
+                if self._runtime_limit_reached(start_ts, max_runtime_minutes):
+                    self.log.info(f'已达到最大运行时长 {max_runtime_minutes} 分钟，自动退出')
+                    return
+                if max_cycles is not None and completed_cycles >= max_cycles:
+                    self.log.info(f'已达到最大运行轮次 {max_cycles}，自动退出')
+                    return
                 now_time = datetime.now().strftime("%H:%M")
                 now_time = '19:50'
                 current_hour = now_time.split(":")[0]
                 accounts_dict = {time:ids for time,ids in accounts_time.items() if time.split(":")[0] == current_hour}
+                if not accounts_dict and self._force_run_now_enabled() and accounts_time:
+                    first_time = next(iter(accounts_time.keys()))
+                    accounts_dict = {first_time: accounts_time[first_time]}
+                    self.log.info("FORCE_RUN_NOW=1，跳过排班等待，立即执行当前账号")
                 self.log.info(f'''当前时间为：{now_time}，当前小时的操作账号为：{accounts_dict}''')
                 if accounts_dict:
                     accounts =  list(set().union(*accounts_dict.values()))  # 所有的账号都集合到一个list中
@@ -212,7 +243,6 @@ class PaperAgent():
                         # 初始化账号bot,获取操作对象、执行操作等
                         bot = TwitterBot(log_path=f"./logs/{self.platform}/{account_id}/{self.platform}_log.log")  
                         await bot.login_by_cookies(account_id=int(account_id))  # 登录账号
-                        pdb.set_trace()
                         propaganda_results = await self.auto_paper_single_account(account_id=int(account_id),paper_info=paper_info,domain=domain,bot=bot)   # 账号运营
                         await asyncio.sleep(random.uniform(5,10))
                         if len(propaganda_results) !=  0 :
@@ -238,9 +268,21 @@ class PaperAgent():
                         bot.driver.quit()  # 关闭浏览器
                         self.log.info(f'账号{account_id}已经执行完所有操作，关闭该账号的driver')
                     self.log.info(f'账号{accounts}已经全部执行完操作，等待下一个时间点')
+                    break
                 else:
                     self.log.info('等待到达目标时间')
-                    await asyncio.sleep(random.uniform(150,300))
+                    wait_seconds = random.uniform(150,300)
+                    if max_runtime_minutes is not None:
+                        remaining_seconds = max(0, max_runtime_minutes * 60 - (time.monotonic() - start_ts))
+                        wait_seconds = min(wait_seconds, remaining_seconds)
+                    if wait_seconds <= 0:
+                        self.log.info(f'已达到最大运行时长 {max_runtime_minutes} 分钟，自动退出')
+                        return
+                    await asyncio.sleep(wait_seconds)
+            completed_cycles += 1
+            if max_cycles is not None and completed_cycles >= max_cycles:
+                self.log.info(f'已达到最大运行轮次 {max_cycles}，自动退出')
+                break
 
     # async def get_domain_keywords(self,domain:str):
     #     '''获取领域的关键字。对于新的领域，生成的关键字存到文件中'''
@@ -295,7 +337,6 @@ class PaperAgent():
                 - 如果和论文相关，则进行评论/转发，并推荐自己的论文
                 - 如果和论文不相关，但是和领域相关，则点赞/评论/快转/转发，转发和评论过程中不推荐自己的论文
                 '''   # 小红书的时间转换
-                pdb.set_trace()
                 if self.platform == 'twitter':
                     today = convert_time_us(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
                 elif self.platform == 'xiaohongshu':   

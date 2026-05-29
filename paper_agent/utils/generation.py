@@ -1,157 +1,315 @@
-# import openai
-# openai.api_key ="EMPTY"
-# openai.api_base = "http://127.0.0.1:8868/v1"   
-from utils.utils import timer,split_think_and_answer
-import re
+from utils.utils import timer, split_think_and_answer
 import requests
 import time
 import os
 import base64
 import json
-import httpx
 import asyncio
+from urllib.parse import urlparse
+from config import CHATGPT_INFO, DEEPSEEK_INFO, GEMMA_INFO, LLM_PROVIDER, MAX_RETRIES, SUPPORTED_LLM_PROVIDERS
+
+
+def _normalize_provider(provider=None):
+    default_provider = os.environ.get("LLM_PROVIDER", LLM_PROVIDER)
+    active_provider = (provider or default_provider or "deepseek").strip().lower()
+    if active_provider == "openai":
+        active_provider = "chatgpt"
+    if active_provider == "siliconflow":
+        active_provider = "gemma"
+    if active_provider not in SUPPORTED_LLM_PROVIDERS:
+        print(f"Unsupported LLM provider: {active_provider}, fallback to deepseek")
+        return "deepseek"
+    return active_provider
+
+
+def _env_or_default(name, default, caster=None):
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    if caster is None:
+        return value
+    try:
+        return caster(value)
+    except Exception:
+        return default
+
+
+def _provider_config(provider):
+    active_provider = _normalize_provider(provider)
+    if active_provider == "chatgpt":
+        return {
+            "API_KEY": _env_or_default("CHATGPT_API_KEY", CHATGPT_INFO.get("API_KEY", "")),
+            "BASE_URL": _env_or_default("CHATGPT_BASE_URL", CHATGPT_INFO.get("BASE_URL", "https://api.openai.com/v1")),
+            "MODEL": _env_or_default("CHATGPT_MODEL", CHATGPT_INFO.get("MODEL", "gpt-4.1")),
+            "CHAT_MODEL": _env_or_default("CHATGPT_CHAT_MODEL", CHATGPT_INFO.get("CHAT_MODEL", "gpt-4.1-mini")),
+            "THINK_MODEL": _env_or_default("CHATGPT_THINK_MODEL", CHATGPT_INFO.get("THINK_MODEL", "gpt-4.1")),
+            "TEMPERATURE": _env_or_default("CHATGPT_TEMPERATURE", CHATGPT_INFO.get("TEMPERATURE", 1.0), float),
+            "TOP_P": _env_or_default("CHATGPT_TOP_P", CHATGPT_INFO.get("TOP_P", 1.0), float),
+            "MAX_TOKEN": _env_or_default("CHATGPT_MAX_TOKEN", CHATGPT_INFO.get("MAX_TOKEN", 8192), int),
+            "PRESENCE_PENALTY": _env_or_default("CHATGPT_PRESENCE_PENALTY", CHATGPT_INFO.get("PRESENCE_PENALTY", 0.0), float),
+        }
+    if active_provider == "gemma":
+        return {
+            "API_KEY": _env_or_default("GEMMA_API_KEY", GEMMA_INFO.get("API_KEY", "")),
+            "BASE_URL": _env_or_default("GEMMA_BASE_URL", GEMMA_INFO.get("BASE_URL", "https://api.siliconflow.com/v1")),
+            "MODEL": _env_or_default("GEMMA_MODEL", GEMMA_INFO.get("MODEL", "google/gemma-4-31B-it")),
+            "CHAT_MODEL": _env_or_default("GEMMA_CHAT_MODEL", GEMMA_INFO.get("CHAT_MODEL", "google/gemma-4-31B-it")),
+            "THINK_MODEL": _env_or_default("GEMMA_THINK_MODEL", GEMMA_INFO.get("THINK_MODEL", "google/gemma-4-31B-it")),
+            "TEMPERATURE": _env_or_default("GEMMA_TEMPERATURE", GEMMA_INFO.get("TEMPERATURE", 0.7), float),
+            "TOP_P": _env_or_default("GEMMA_TOP_P", GEMMA_INFO.get("TOP_P", 1.0), float),
+            "MAX_TOKEN": _env_or_default("GEMMA_MAX_TOKEN", GEMMA_INFO.get("MAX_TOKEN", 8192), int),
+            "PRESENCE_PENALTY": _env_or_default("GEMMA_PRESENCE_PENALTY", GEMMA_INFO.get("PRESENCE_PENALTY", 0.0), float),
+        }
+    return {
+        "API_KEY": _env_or_default("DEEPSEEK_API_KEY", DEEPSEEK_INFO.get("API_KEY", "")),
+        "BASE_URL": _env_or_default("DEEPSEEK_BASE_URL", DEEPSEEK_INFO.get("BASE_URL", "https://api.deepseek.com")),
+        "MODEL": _env_or_default("DEEPSEEK_MODEL", DEEPSEEK_INFO.get("MODEL", "deepseek-reasoner")),
+        "CHAT_MODEL": _env_or_default("DEEPSEEK_CHAT_MODEL", DEEPSEEK_INFO.get("CHAT_MODEL", "deepseek-chat")),
+        "THINK_MODEL": _env_or_default("DEEPSEEK_THINK_MODEL", DEEPSEEK_INFO.get("THINK_MODEL", "deepseek-reasoner")),
+        "TEMPERATURE": _env_or_default("DEEPSEEK_TEMPERATURE", DEEPSEEK_INFO.get("TEMPERATURE", 1.0), float),
+        "TOP_P": _env_or_default("DEEPSEEK_TOP_P", DEEPSEEK_INFO.get("TOP_P", 1.0), float),
+        "MAX_TOKEN": _env_or_default("DEEPSEEK_MAX_TOKEN", DEEPSEEK_INFO.get("MAX_TOKEN", 8192), int),
+        "PRESENCE_PENALTY": _env_or_default("DEEPSEEK_PRESENCE_PENALTY", DEEPSEEK_INFO.get("PRESENCE_PENALTY", 0.0), float),
+    }
+
+
+def describe_active_provider(provider=None):
+    active_provider = _normalize_provider(provider)
+    config = _provider_config(active_provider)
+    api_key = config.get("API_KEY") or ""
+    if api_key:
+        masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
+    else:
+        masked_key = "<empty>"
+    return {
+        "provider": active_provider,
+        "base_url": config.get("BASE_URL"),
+        "model": config.get("MODEL"),
+        "chat_model": config.get("CHAT_MODEL"),
+        "think_model": config.get("THINK_MODEL"),
+        "api_key": masked_key,
+    }
+
+
+def _provider_headers(provider):
+    config = _provider_config(provider)
+    return {
+        "Authorization": f"Bearer {config['API_KEY']}",
+        "Content-Type": "application/json",
+    }
+
+
+def _provider_url(provider):
+    config = _provider_config(provider)
+    return f"{config['BASE_URL'].rstrip('/')}/chat/completions"
+
+
+def _should_bypass_proxy(provider):
+    active_provider = _normalize_provider(provider)
+    if active_provider == "gemma":
+        return True
+    base_url = _provider_config(active_provider).get("BASE_URL", "")
+    host = urlparse(base_url).netloc.lower()
+    return "api.siliconflow.com" in host
+
+
+def _ensure_no_proxy_for_siliconflow():
+    bypass_hosts = "api.siliconflow.com"
+    for env_name in ("NO_PROXY", "no_proxy"):
+        current = os.environ.get(env_name, "")
+        parts = [item.strip() for item in current.split(",") if item.strip()]
+        if bypass_hosts not in parts:
+            parts.append(bypass_hosts)
+        os.environ[env_name] = ",".join(parts)
+
+
+def _provider_timeout(active_provider, purpose="chat"):
+    if active_provider == "gemma":
+        return 150 if purpose == "chat" else 210
+    if active_provider == "deepseek":
+        return 60 if purpose == "chat" else 120
+    return 60 if purpose == "chat" else 90
+
+
+def _message_text(message_value):
+    if isinstance(message_value, str):
+        return message_value
+    if isinstance(message_value, list):
+        parts = []
+        for item in message_value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and item.get("text"):
+                parts.append(item["text"])
+                continue
+            text_info = item.get("text")
+            if isinstance(text_info, dict) and text_info.get("value"):
+                parts.append(text_info["value"])
+        return "".join(parts)
+    return ""
+
+
+async def _chat_completion(prompt, provider, model, timeout=60, retries=MAX_RETRIES):
+    active_provider = _normalize_provider(provider)
+    config = _provider_config(active_provider)
+    if not config.get("API_KEY"):
+        print(f"Call {active_provider} skipped: empty API key")
+        return None
+    data = {
+        "model": model,
+        "messages": prompt,
+        "temperature": config["TEMPERATURE"],
+        "top_p": config["TOP_P"],
+        "max_tokens": config["MAX_TOKEN"],
+        "presence_penalty": config["PRESENCE_PENALTY"],
+        "stream": False,
+    }
+
+    for attempt in range(retries):
+        try:
+            if _should_bypass_proxy(active_provider):
+                _ensure_no_proxy_for_siliconflow()
+            request_kwargs = {
+                "url": _provider_url(active_provider),
+                "headers": _provider_headers(active_provider),
+                "json": data,
+                "timeout": timeout,
+            }
+            if _should_bypass_proxy(active_provider):
+                session = requests.Session()
+                session.trust_env = False
+                response = session.post(**request_kwargs)
+            else:
+                response = requests.post(**request_kwargs)
+            if response.status_code in (401, 403):
+                provider_info = describe_active_provider(active_provider)
+                print(
+                    f"Call {active_provider} auth failed: "
+                    f"base_url={provider_info['base_url']}, "
+                    f"model={model}, api_key={provider_info['api_key']}"
+                )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]
+        except Exception as e:
+            print(f"Call {active_provider} failed (attempt {attempt + 1}): {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(3 * (attempt + 1))
+            else:
+                return None
+
+
+def _extract_answer_and_think(message):
+    if not message:
+        return None, None
+
+    answer = _message_text(message.get("content", ""))
+    think = _message_text(message.get("reasoning_content", ""))
+
+    if not think and answer:
+        split_think, split_answer = split_think_and_answer(answer)
+        if split_think or split_answer:
+            think = split_think
+            answer = split_answer or answer
+
+    return think, answer
+
+
 @timer
 async def content_generation(prompt):
-    # response = openai.ChatCompletion.create(model='/data/yetong/tools/Qwen1.5-72B-Chat-GPTQ-Int4', messages=prompt, n=1, stop=["<|im_end|>", "<|endoftext|>", "<|im_start|>"])
-    # response = response['choices'][0]['message']['content']
     url = "http://region-3.seetacloud.com:47826/general"
-    prompt = {"messages":prompt}
-    response = requests.post(url,json=prompt).json()
+    payload = {"messages": prompt}
+    response = requests.post(url, json=payload).json()
     return response["response"][0]
 
 
+async def general_generation(prompt, provider=None, model=None):
+    active_provider = _normalize_provider(provider)
+    config = _provider_config(active_provider)
+    message = await _chat_completion(
+        prompt,
+        provider=active_provider,
+        model=model or config["CHAT_MODEL"],
+        timeout=_provider_timeout(active_provider, purpose="chat"),
+        retries=MAX_RETRIES,
+    )
+    if not message:
+        return None
+    return _message_text(message.get("content"))
 
 
-# qwen3-32B-idata，使用不思考模式
-async def general_generation(prompt):
-    '''idata,不使用思考模式'''
-    data = {"model":"Qwen/Qwen3-32B","messages":prompt,"n":1,"stop":["&lt;|im_end|&gt;", "&lt;|endoftext|&gt;", "&lt;|im_start|&gt;"],"chat_template_kwargs": {"enable_thinking": False}}
-    url = "https://www.chattydog.top/llm/chat" 
-    # 最多尝试调用十次 
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, json=data, timeout=60)
-            response.raise_for_status()  # 检查 HTTP 状态码
-            response_json = response.json()
-
-            return response_json['choices'][0]['message']['content']
-
-        except Exception as e:
-            print(f"调用失败 (第 {attempt+1} 次): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(3 * (attempt + 1))  # 逐次增加等待时间
-            else:
-                return  
-            
-
-# qwen3-32B,使用思考模式，返回think和answer
-async def general_generation_think(prompt):
-    '''idata,使用思考模式'''
-    data = {"model":"Qwen/Qwen3-32B","messages":prompt,"n":1,"stop":["&lt;|im_end|&gt;", "&lt;|endoftext|&gt;", "&lt;|im_start|&gt;"],"chat_template_kwargs": {"enable_thinking": True}}
-    url = "https://www.chattydog.top/llm/chat"   
-
-    # 最多尝试调用十次 
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, json=data, timeout=30)
-            response.raise_for_status()  # 检查 HTTP 状态码
-            response_json = response.json()
-
-            response_text = response_json['choices'][0]['message']['content']
-            think,answer = split_think_and_answer(response_text)
-            if think == '' or answer == '':
-                continue
-            return think,answer
-
-        except Exception as e:
-            print(f"调用失败 (第 {attempt+1} 次): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(3 * (attempt + 1))  # 逐次增加等待时间
-            else:
-                return None,None
+async def general_generation_think(prompt, provider=None, model=None):
+    active_provider = _normalize_provider(provider)
+    config = _provider_config(active_provider)
+    timeout = _provider_timeout(active_provider, purpose="think")
+    message = await _chat_completion(
+        prompt,
+        provider=active_provider,
+        model=model or config["THINK_MODEL"],
+        timeout=timeout,
+        retries=MAX_RETRIES,
+    )
+    return _extract_answer_and_think(message)
 
 
-# async def general_generation(prompt):
-#     '''idata,不使用思考模式'''
-#     data = {
-#         "model":"Qwen/Qwen3-32B",
-#         "messages":prompt,
-#         "n":1,
-#         "stop":["&lt;|im_end|&gt;", "&lt;|endoftext|&gt;", "&lt;|im_start|&gt;"],
-#         "chat_template_kwargs": {"enable_thinking": False}
-#     }
-#     url = "http://www.chattydog.top/llm/chat"   
-
-#     # 最多尝试调用十次 
-#     max_retries = 10
-#     async with httpx.AsyncClient(timeout=30) as client: 
-#         for attempt in range(max_retries):
-#             try:
-#                 response = await client.post(url, json=data)  # 异步 POST
-#                 response.raise_for_status()  # 检查 HTTP 状态码
-#                 response_json = response.json()
-#                 return response_json['choices'][0]['message']['content']
-
-#             except  Exception as e:
-#                 print(f"调用失败 (第 {attempt+1} 次): {e}")
-#                 if attempt < max_retries - 1:
-#                     await asyncio.sleep(3 * (attempt + 1))  
-#                 else:
-#                     return None
+async def general_generation_deepseek(prompt, provider=None, model=None):
+    active_provider = _normalize_provider(provider)
+    config = _provider_config(active_provider)
+    message = await _chat_completion(
+        prompt,
+        provider=active_provider,
+        model=model or config["MODEL"],
+        timeout=_provider_timeout(active_provider, purpose="chat"),
+        retries=MAX_RETRIES,
+    )
+    if not message:
+        return None
+    return _message_text(message.get("content"))
 
 
-
-
-# 发帖
-async def generation_post(text,model,language="中文简体",output_len=1000,character=None,style='formal'):
-    data = {"input": text,
-            "model": model,  
-            "language":language,  
-            "description":character,
-            "output_len":output_len,
-            "style":style}
-    api = "http://172.16.32.11:30103/post"  #发帖
+async def generation_post(text, model, language="涓枃绠€浣?", output_len=1000, character=None, style="formal"):
+    data = {
+        "input": text,
+        "model": model,
+        "language": language,
+        "description": character,
+        "output_len": output_len,
+        "style": style,
+    }
+    api = "http://172.16.32.11:30103/post"
     start = time.time()
     response = requests.post(api, json=data).json()
     end = time.time()
     response_time = end - start
-    return response,response_time    # 返回的是字符串
+    return response, response_time
 
 
-
-
-# 转发或者评论
-async def generation_comment(text,model,language="中文简体",output_len=1000,character=None,style='formal'):
-    data = {"input": text,
-            "model": model,  
-            "language":language,  
-            "description":character,
-            "style":style,
-            "output_len":output_len}
-    api = "http://172.16.32.11:30103/comment" #发帖
+async def generation_comment(text, model, language="涓枃绠€浣?", output_len=1000, character=None, style="formal"):
+    data = {
+        "input": text,
+        "model": model,
+        "language": language,
+        "description": character,
+        "style": style,
+        "output_len": output_len,
+    }
+    api = "http://172.16.32.11:30103/comment"
     start = time.time()
     response = requests.post(api, json=data).json()
     end = time.time()
     response_time = end - start
-    return response,response_time
-
-
+    return response, response_time
 
 
 async def picture_generation(prompt):
-    # 设置API密钥和请求URL
-    ARK_API_KEY = "94abcc98-9ec1-4340-8217-5cf14264732f"
+    ark_api_key = "94abcc98-9ec1-4340-8217-5cf14264732f"
     url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-
-    # 设置请求头
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {ARK_API_KEY}"
+        "Authorization": f"Bearer {ark_api_key}",
     }
-
-    # 设置请求体JSON数据
     data = {
         "model": "doubao-seedream-3-0-t2i-250415",
         "prompt": prompt,
@@ -159,48 +317,37 @@ async def picture_generation(prompt):
         "size": "1024x1024",
         "seed": 12,
         "guidance_scale": 2.5,
-        "watermark": False
+        "watermark": False,
     }
 
-    
-    # 发送POST请求
     response = requests.post(url, headers=headers, data=json.dumps(data))
-    
-    # 检查响应状态码
     if response.status_code == 200:
-        # 请求成功，打印响应内容
-        images = response.json()['data']
+        images = response.json()["data"]
     else:
-        # 请求失败，打印错误信息
-        print(f"请求失败，状态码: {response.status_code}, 错误信息: {response.text}")
+        print(f"Request failed, status: {response.status_code}, error: {response.text}")
         images = None
-    if images:
-        # 处理返回的图片数据
-        
-        current_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-        abs_path = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-        save_dir = os.path.join(abs_path,f"images\\{current_time}")
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        image_paths = []
-        for i, image in enumerate(images):
-            # 将base64编码的图片数据解码并保存为文件
-            image_data = base64.b64decode(image['b64_json'])
-            save_path = os.path.join(save_dir, f"image_{i}.png")
-            with open(save_path, "wb") as f:
-                f.write(image_data)
-            image_paths.append(save_path)
-        # 返回图片路径
-        return image_paths
-    else:
+
+    if not images:
         return []
 
+    current_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    abs_path = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    save_dir = os.path.join(abs_path, f"images\\{current_time}")
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    image_paths = []
+    for i, image in enumerate(images):
+        image_data = base64.b64decode(image["b64_json"])
+        save_path = os.path.join(save_dir, f"image_{i}.png")
+        with open(save_path, "wb") as f:
+            f.write(image_data)
+        image_paths.append(save_path)
+    return image_paths
 
 
-if __name__ == '__main__':
-    import asyncio
-    # str1.encode('utf-8').decode('unicode_escape')
+if __name__ == "__main__":
     async def main():
-        # print(await general_generation([{'role':'system','content':'你好'}]))
-        print(await generation_post(text='''support kamala harris''',model='Qwen-72b-Instruct',language='英文'))
+        print(await generation_post(text="support kamala harris", model="Qwen-72b-Instruct", language="鑻辨枃"))
+
     asyncio.run(main())

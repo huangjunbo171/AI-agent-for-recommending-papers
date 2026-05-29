@@ -23,33 +23,77 @@ import random
 
 class WebDriver():
     """用selenium网页模拟实现的一些基本功能"""    
-    def __init__(self, log_path,driver_path: str = DEFAULT_DRIVER_PATH,ip=None,username=None,password=None,use_proxy=False,headless=False) -> None:
-        self.cookies = None
-        ser = Service(driver_path)
-        chrome_options = webdriver.ChromeOptions()
-
-        # # #为Chrome配置无头模式
-        if headless:
-            chrome_options.add_argument("--headless")  
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-
-        # 把允许提示这个弹窗关闭
-        prefs = {"profile.default_content_setting_values.notifications": 2}
-        chrome_options.add_experimental_option("prefs", prefs)
-        chrome_options.add_argument("-ignore-certificate-errors") #忽略证书
-        chrome_options.add_argument("-ignore -ssl-errors") #忽略ssl错误
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled") #防止被识别为机器人
-        chrome_options.add_experimental_option("excludeSwitches", ['enable-automation'])  # 去掉顶部自动测试提示语
-        # chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-        # 添加浏览器请求header
-        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
-        chrome_options.add_argument(f'--user-agent={user_agent}')
+    @staticmethod
+    def get_chrome_options(
+        fingerprint:dict  = None,
+        headless: bool = False,
+        ip: str = None,
+        username: str = None,
+        password: str = None,
+        use_proxy: bool = False
+    ) -> webdriver.ChromeOptions:
+        """
+        生成统一的 Chrome 配置选项
         
-        if ip: # ip是城市
-            chrome_options.add_argument("--start-maximized")
-            # 根据ip获取IP 和 port
+        Args:
+            fingerprint: 指纹信息，包含 user-agent 等配置
+            language: 接受语言，默认 "en-US,en;q=0.9"
+            headless: 无头模式，默认 False
+            ip: 城市 IP（来自 config.py 的 CITY_INFO），用于天启代理
+            username: 代理用户名
+            password: 代理密码
+            use_proxy: 是否使用内置代理 (MIMN_IP)
+        
+        Returns:
+            配置好的 WebDriver.ChromeOptions 对象
+        """
+        options = webdriver.ChromeOptions()
+        
+        # 无头模式配置
+        if headless:
+            options.add_argument("--headless")
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--disable-dev-shm-usage')
+        
+        
+        # 通知和证书配置
+        prefs = {"profile.default_content_setting_values.notifications": 2}
+        options.add_experimental_option("prefs", prefs)
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--ignore-ssl-errors")
+        
+        # 反爬虫和自动化检测配置
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
+        options.add_experimental_option("useAutomationExtension", False)
+        
+        # 指纹/UA/语言/配置目录 
+        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+        language = 'en-US,en;q=0.9'
+        if fingerprint:
+            # 用户数据目录（多开隔离）
+            profile_path = fingerprint.get("profile_path",None)
+            if profile_path:
+                os.makedirs(profile_path, exist_ok=True)
+                options.add_argument(f"--user-data-dir={profile_path}")
+            # UserAgent          
+            user_agent = fingerprint.get("user_agent") or user_agent
+            # 语言
+            language = fingerprint.get("languages")[0] if fingerprint.get("languages") else language
+        # 配置
+        options.add_argument(f"--lang={language}")
+        options.add_argument(f'--user-agent={user_agent}')
+
+
+        # 窗口大小配置
+        options.add_argument("--start-maximized")
+        # 禁用 WebGL 和音频
+        options.add_argument("--disable-webgl")
+        options.add_argument("--mute-audio")
+        
+        # 代理配置 - 天启 IP
+        if ip:
             ip_port = get_ip_port(ip=ip)
             if ip_port:
                 proxyauth_plugin_path = create_proxyauth_extension(
@@ -58,19 +102,67 @@ class WebDriver():
                     proxy_username=username,
                     proxy_password=password
                 )
-                chrome_options.add_extension(proxyauth_plugin_path)
-                
-        if use_proxy:
-            chrome_options.add_argument("--proxy-server=http://{}:{}".format(MIMN_IP["IP"],MIMN_IP["PORT"]))
-        else:
-            chrome_options.add_argument('--proxy-server="direct://"')
-            chrome_options.add_argument('--proxy-bypass-list=*')  # 忽略所有代理
+                options.add_extension(proxyauth_plugin_path)
         
-        self.driver = webdriver.Chrome(service=ser,options=chrome_options)
-        self.driver.maximize_window()  # 设置页面最大化，避免元素被隐藏
-        #设置log
-        # log_path = os.path.join(os.path.dirname(__file__), "log\\webdriver.log")
+        # 代理配置 - 内置代理或直连
+        elif use_proxy:
+            options.add_argument(f"--proxy-server=http://{MIMN_IP['IP']}:{MIMN_IP['PORT']}")
+        else:
+            options.add_argument('--proxy-server="direct://"')
+            options.add_argument('--proxy-bypass-list=*')
+        
+        return options
+    
+
+
+    def __init__(
+        self, 
+        log_path, 
+        driver_path: str = DEFAULT_DRIVER_PATH, 
+        ip: str = None, 
+        username: str= None, 
+        password: str=None, 
+        use_proxy: bool=False, 
+        headless: bool=False,
+        fingerprint: dict=None
+    ) -> None:
+        # 设置 log
         self.log = logger(filename=log_path)
+
+        self.cookies = None
+        self.fingerprint = fingerprint
+        # 使用 get_chrome_options 生成配置
+        chrome_options = self.get_chrome_options(
+            fingerprint=self.fingerprint,
+            headless=headless,
+            ip=ip,
+            username=username,
+            password=password,
+            use_proxy=use_proxy
+        )
+        
+        if driver_path and os.path.isfile(driver_path):
+            ser = Service(driver_path)
+            self.driver = webdriver.Chrome(service=ser, options=chrome_options)
+            self.log.info(f"Using configured chromedriver: {driver_path}")
+        else:
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.log.info("Configured chromedriver path not found, falling back to Selenium Manager")
+        self.driver.maximize_window()  # 设置页面最大化，避免元素被隐藏
+        
+        # 注入 CDP 脚本，隐藏 webdriver 标记并伪造 navigator 属性
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+            """
+        })
+        
+        self.log.info("Chrome 驱动初始化成功")
+
+
 
     
     def get_cookies(self, url: str = None):
@@ -83,6 +175,8 @@ class WebDriver():
         self.log.info("cookies get")
         return Cookies
         
+
+
         
     def check_cookies(self, username: str = "",check_url:str = ""):
         "检查cookie有效性 check_url建议为网站主页或用户主页，通过检测网站文本中有无username来判断"

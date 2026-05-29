@@ -5,7 +5,10 @@ import os
 import sys 
 pythonpath = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0,pythonpath)
-from twitter_agent.twitter_bot import TwitterBot
+try:
+    from twitter_agent.twitter_bot import TwitterBot
+except ModuleNotFoundError:
+    from twitter_bot import TwitterBot
 from utils.log import logger
 from utils.utils import convert_time_us
 from collections import defaultdict
@@ -19,7 +22,10 @@ import pdb
 from datetime import timedelta
 import random
 import time
-from twitter_agent.scrap_news_bot import ScrapNewsBot
+try:
+    from twitter_agent.scrap_news_bot import ScrapNewsBot
+except ModuleNotFoundError:
+    from scrap_news_bot import ScrapNewsBot
 
 
 class TwitterPlanner:
@@ -69,7 +75,8 @@ class TwitterPlanner:
             time.sleep(random.uniform(1,3))
             return target_informations
 
-        for following in random.sample(following_results, 5):
+        sample_size = min(len(following_results), 5)
+        for following in random.sample(following_results, sample_size):
             time.sleep(random.uniform(1,3))
             target_information = []
             nickname = following.split('/')[-1]
@@ -262,7 +269,7 @@ class TwitterPlanner:
                         urls = file.readlines()  
                         following_list  = [result.strip() for result in urls]  # 去除每行末尾的换行符
                 else:
-                    await twitter.login(account_id=account_id) # 登录账号
+                    await twitter.login_by_cookies(account_id=account_id) # 仅使用 cookies 登录
                     following_list = twitter.get_user_following(url=url)  # 获取harris的关注列表
                 following_list = list(set(following_list))  # 去重
                 if len(following_list) >= 5:
@@ -332,7 +339,7 @@ class TwitterPlanner:
                         urls = file.readlines()  
                         following_list  = [result.strip() for result in urls]  # 去除每行末尾的换行符
                 else:
-                    await twitter.login(account_id=account_id) # 登录账号
+                    await twitter.login_by_cookies(account_id=account_id) # 仅使用 cookies 登录
                     following_list = twitter.get_user_following(url=url)  # 获取harris的关注列表
                 following_list = list(set(following_list))  # 去重
                 if len(following_list) >= 5:

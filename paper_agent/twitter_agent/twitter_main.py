@@ -7,11 +7,20 @@ from datetime import datetime
 from fastapi import FastAPI, Depends,Request,UploadFile, File
 import uvicorn
 from typing import List
-from twitter_agent.twitter_request import InteractionRequest,create_response
-from twitter_agent.twitter_bot import TwitterBot
-from twitter_agent.twitter_validator import validate_request
+try:
+    from twitter_agent.twitter_request import InteractionRequest,create_response
+    from twitter_agent.twitter_bot import TwitterBot
+    from twitter_agent.cookie_login_patch import cookie_only_login_by_cookies
+    from twitter_agent.twitter_validator import validate_request
+except ModuleNotFoundError:
+    from twitter_request import InteractionRequest,create_response
+    from twitter_bot import TwitterBot
+    from cookie_login_patch import cookie_only_login_by_cookies
+    from twitter_validator import validate_request
 import time
 from http import HTTPStatus
+
+TwitterBot.login_by_cookies = cookie_only_login_by_cookies
 
 app = FastAPI()
 
