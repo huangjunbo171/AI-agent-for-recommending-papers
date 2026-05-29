@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 import requests
 import pdb
 import re
+import zipfile
 from paper_agent.scrap_objects import ScrapObjects
 import schedule
 import multiprocessing
@@ -98,6 +99,118 @@ class PaperAgent():
         # 按时间顺序排序字典
         sorted_time_dict = dict(sorted(time_to_ids.items()))
         return sorted_time_dict
+
+    def _paper_matches_domain(self, paper: dict, domain: str = None):
+        if not domain:
+            return True
+        haystack = " ".join([
+            str(paper.get("Title") or ""),
+            str(paper.get("Abstract") or ""),
+            " ".join(paper.get("Authors") or []),
+        ]).lower()
+        normalized_domain = re.sub(r"[^a-z0-9]+", " ", domain.lower()).strip()
+        domain_tokens = [token for token in normalized_domain.split() if len(token) > 2]
+        if normalized_domain and normalized_domain in haystack:
+            return True
+        if "large language models for recommendation" in normalized_domain:
+            aliases = ["llm4rec", "recommendation", "recommender", "personalized recommendation", "large language model", "llm"]
+            if any(alias in haystack for alias in aliases):
+                return True
+        token_hits = sum(1 for token in domain_tokens if token in haystack)
+        return token_hits >= max(1, min(2, len(domain_tokens)))
+
+    def _resolve_local_paper_path(self, paper_path=None):
+        if paper_path and os.path.isdir(paper_path):
+            return paper_path
+        if paper_path and os.path.isfile(paper_path) and paper_path.lower().endswith(".zip"):
+            zip_file = paper_path
+        else:
+            zip_root = os.path.join(".", "papers", "zip_folder")
+            if not os.path.isdir(zip_root):
+                return None
+            zip_files = sorted(
+                [os.path.join(zip_root, name) for name in os.listdir(zip_root) if name.lower().endswith(".zip")],
+                reverse=True,
+            )
+            if not zip_files:
+                return None
+            zip_file = zip_files[0]
+
+        zip_name = os.path.splitext(os.path.basename(zip_file))[0]
+        extract_root = os.path.join(".", "papers", "extracted")
+        extract_path = os.path.join(extract_root, zip_name)
+        os.makedirs(extract_root, exist_ok=True)
+        if not os.path.isdir(extract_path):
+            with zipfile.ZipFile(zip_file, "r") as zip_ref:
+                zip_ref.extractall(extract_root)
+        return extract_path
+
+    def get_local_paper_candidates(self, paper_path=None, domain: str = None):
+        extract_path = self._resolve_local_paper_path(paper_path=paper_path)
+        if not extract_path or not os.path.isdir(extract_path):
+            self.log.info("本地论文目录不存在，无法使用本地论文兜底")
+            return []
+
+        md_files = [name for name in os.listdir(extract_path) if name.endswith("_en.md")]
+        if not md_files:
+            md_files = [name for name in os.listdir(extract_path) if name.endswith(".md")]
+        if not md_files:
+            self.log.info(f"本地论文目录 {extract_path} 中没有 markdown 文件")
+            return []
+
+        md_path = os.path.join(extract_path, md_files[0])
+        with open(md_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        section_matches = list(re.finditer(r"(?m)^##\s+(?P<title>.+?)\s*$", text))
+        papers = []
+        for index, match in enumerate(section_matches):
+            start = match.start()
+            end = section_matches[index + 1].start() if index + 1 < len(section_matches) else len(text)
+            section = text[start:end]
+            title = match.group("title").strip()
+
+            authors = []
+            authors_match = re.search(r"(?mi)^>\s*Authors:\s*(.+?)\s*$", section)
+            if authors_match:
+                authors = [name.strip() for name in authors_match.group(1).split(",") if name.strip()]
+
+            abstract = None
+            abstract_match = re.search(r"(?mi)^###\s*Abstract\s*$", section)
+            if abstract_match:
+                abstract_text = section[abstract_match.end():]
+                abstract_end = re.search(r"(?ms)(?=^\s*!\[)|(?=^\s*\*\*Review\*\*)|(?=^###\s)|(?=^##\s)", abstract_text)
+                abstract = abstract_text[:abstract_end.start()].strip() if abstract_end else abstract_text.strip()
+
+            url = None
+            url_match = re.search(r"(?mi)^https?://arxiv\.org/\S+\b", section)
+            if url_match:
+                url = url_match.group(0).strip()
+
+            image_path = None
+            image_match = re.search(r"!\[.*?\]\((?P<path>[^)]+)\)", section)
+            if image_match:
+                raw_path = image_match.group("path").strip()
+                image_path = raw_path if os.path.isabs(raw_path) else os.path.join(extract_path, *[part for part in raw_path.split("/") if part])
+                if not os.path.exists(image_path):
+                    image_path = None
+
+            papers.append({
+                "Paper_id": None,
+                "Title": title,
+                "Abstract": abstract,
+                "Authors": authors,
+                "Image_path": image_path,
+                "URL": url,
+                "Gene_keywords": None,
+            })
+
+        matched = [paper for paper in papers if self._paper_matches_domain(paper, domain=domain)]
+        if matched:
+            self.log.info(f"从本地论文读取到 {len(matched)} 篇与 {domain} 相关的候选论文")
+            return matched
+        self.log.info(f"本地论文未严格匹配领域 {domain}，回退使用全部 {len(papers)} 篇本地论文")
+        return papers
 
 
     async def predict_action_time(self,account_id):
@@ -234,16 +347,29 @@ class PaperAgent():
                         '''读取数据库从数据库中选择一个未宣传过的论文进行宣传'''
                         # 读取数据库，从中找贴文进行宣传
                         select_sql = f'''SELECT pi.Paper_id, pi.Title, pi.Image_path, pi.URL FROM papers_info AS pi WHERE JSON_CONTAINS(pi.Field, JSON_QUOTE('{domain}'), '$') AND NOT EXISTS (SELECT 1 FROM papers_promotion AS pp WHERE pp.Paper_id  = pi.Paper_id AND pp.Platform  = '{self.platform}' AND pp.Account_id = {account_id}) ORDER BY pi.Paper_id;  '''
-                        paper_results = self.paper_database.get_dict_data_sql(sql=select_sql)
+                        try:
+                            paper_results = self.paper_database.get_dict_data_sql(sql=select_sql)
+                        except Exception as e:
+                            self.log.info(f'论文数据库不可用，改为从本地论文读取：{e}')
+                            paper_results = self.get_local_paper_candidates(paper_path=paper_path, domain=domain)
                         if not paper_results:
                             self.log.info(f'数据库中不存在{domain}的相关论文')
                             return
                         # 随机选择一个domain领域的文章进行宣传
                         paper = random.choice(paper_results)
-                        scrap_paper = ScrapObjects(log_path=f'./logs/paperagent/twitter/scrap_paper/{account_id}/scrap_paper_log.log')
-                        paper_info = await scrap_paper.scrap_arxiv(title=paper['Title'],domain=domain)
-                        paper_info['image_paths'] = [paper['Image_path']]  # 转换成list
-                        paper_info['Paper_id'] = paper['Paper_id']
+                        if paper.get('Abstract') and paper.get('URL'):
+                            paper_info = {
+                                "Title": paper["Title"],
+                                "Abstract": paper.get("Abstract"),
+                                "URL": paper.get("URL"),
+                                "Gene_keywords": paper.get("Gene_keywords"),
+                                "Authors": paper.get("Authors"),
+                            }
+                        else:
+                            scrap_paper = ScrapObjects(log_path=f'./logs/paperagent/twitter/scrap_paper/{account_id}/scrap_paper_log.log')
+                            paper_info = await scrap_paper.scrap_arxiv(title=paper['Title'],domain=domain)
+                        paper_info['image_paths'] = [paper['Image_path']] if paper.get('Image_path') else []
+                        paper_info['Paper_id'] = paper.get('Paper_id')
                         self.log.info(f'账号{account_id}要宣传的论文信息是：{paper_info}')
                         
                         # 初始化账号bot,获取操作对象、执行操作等
@@ -251,7 +377,7 @@ class PaperAgent():
                         await bot.login_by_cookies(account_id=int(account_id))  # 登录账号
                         propaganda_results = await self.auto_paper_single_account(account_id=int(account_id),paper_info=paper_info,domain=domain,bot=bot)   # 账号运营
                         await asyncio.sleep(random.uniform(5,10))
-                        if len(propaganda_results) !=  0 :
+                        if len(propaganda_results) !=  0 and paper_info.get('Paper_id') is not None:
                             # 查询account_id的nickname
                             select_nickname = f'''SELECT Account FROM accounts_info WHERE Account_id = {account_id}'''
                             account_nickname = self.database.get_dict_data_sql(select_nickname)[0]['Account']
@@ -259,6 +385,8 @@ class PaperAgent():
                             insert_sql = '''INSERT INTO papers_promotion(`Paper_id`,`Platform`,`Account_id`,`Account`,`Post_URL`,`Update_time`) VALUES (%s,%s,%s,%s,%s,%s)'''
                             self.database.operation(insert_sql,(paper_info['Paper_id'],'twitter',account_id,account_nickname,json.dumps(propaganda_results),datetime.now()))
                             self.log.info(f'账号{account_id}宣传论文{paper_info["Title"]}的结果已经存入到数据库中')
+                        elif len(propaganda_results) != 0:
+                            self.log.info('当前论文来自本地文件，跳过 papers_promotion 入库')
                         # 获取通知、回复评论等内容
                         if self.platform == 'twitter':
                             accounts_notify_time[int(account_id)] = await self.get_notification_messages(account=int(account_id), time_limit=accounts_notify_time[int(account_id)],bot=bot) 
@@ -328,8 +456,15 @@ class PaperAgent():
         # 获取领域关键字
         # domain_keywords = await self.get_domain_keywords(domain=domain)
         _,response = await general_generation_think([{"role":"system","content":generate_domain_keywords_prompt(language=self.language)},{"role":"user","content":domain}]) # 32B
-        domain_keywords = response.split(',')
-        self.log.info(f'生成的 {domain} 关键字是：{domain_keywords}')
+        domain_keywords = [item.strip() for item in (response or "").split(',') if item and item.strip()]
+        if not domain_keywords:
+            domain_keywords = [domain] if domain else ["large language models"]
+            self.log.info(f'模型未返回有效领域关键词，回退为默认关键词：{domain_keywords}')
+        else:
+            self.log.info(f'生成的 {domain} 关键字是：{domain_keywords}')
+        if not paper_info.get('Gene_keywords'):
+            paper_info['Gene_keywords'] = domain_keywords[:]
+            self.log.info(f'论文关键词为空，回退使用领域关键词：{paper_info["Gene_keywords"]}')
         
         # 获取账号人设
         character =  await self.get_account_character(account_id=int(account_id))
