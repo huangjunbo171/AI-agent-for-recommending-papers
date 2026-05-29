@@ -29,17 +29,23 @@ try:
     from paper_agent.prompts_test import *
 except ModuleNotFoundError:
     from prompts_test import *
-from xhs_agent.xhs_bot import XiaohongshuBot
-from xhs_agent.xhs_planner import XiaohongshuPlanner
-# 构造platform和bot的映射
-platform_to_bot = {
-    "twitter": TwitterBot,
-    "xiaohongshu": XiaohongshuBot
-}
-platform_to_planner = {
-    "twitter": TwitterPlanner,
-    "xiaohongshu": XiaohongshuPlanner
-}
+# 构造platform和bot/planner的映射。跨平台依赖按需导入，避免 Twitter 流程被 xhs/weibo 依赖阻塞。
+def get_bot_class(platform: str):
+    if platform == "twitter":
+        return TwitterBot
+    if platform == "xiaohongshu":
+        from xhs_agent.xhs_bot import XiaohongshuBot
+        return XiaohongshuBot
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
+def get_planner_class(platform: str):
+    if platform == "twitter":
+        return TwitterPlanner
+    if platform == "xiaohongshu":
+        from xhs_agent.xhs_planner import XiaohongshuPlanner
+        return XiaohongshuPlanner
+    raise ValueError(f"Unsupported platform: {platform}")
 
 class PaperAgent():
     def __init__(self,platform:str='twitter',log_path='./logs/paperagent/paper_log.log'):
@@ -124,7 +130,7 @@ class PaperAgent():
         for account_id in account_ids:
             if account_ids.index(account_id) == 0:
                 if is_predict:
-                    planner = platform_to_planner[self.platform](log_path=f"./logs/{self.platform}/{account_id}/planner_log.log")
+                    planner = get_planner_class(self.platform)(log_path=f"./logs/{self.platform}/{account_id}/planner_log.log")
                     action_time = await planner.get_prediction_time(url=url,account_id=account_id,history=history)
                     self.log.info(f'''预测到{account_id}的操作时间为：{action_time}''')
                 else:
@@ -202,7 +208,7 @@ class PaperAgent():
             # 将账号时间规范化
             self.log.info(f'账号的操作时间是：{accounts_time}')
             # planner = TwitterPlanner(log_path=f"./logs/{self.platform}/{account_ids[0]}/{self.platform}_log.log")
-            planner = platform_to_planner[self.platform](log_path=f"./logs/{self.platform}/{account_ids[0]}/{self.platform}_log.log")
+            planner = get_planner_class(self.platform)(log_path=f"./logs/{self.platform}/{account_ids[0]}/{self.platform}_log.log")
             accounts_time = planner.fomat_action_time(accounts_time)    # {'05:30': ['1'], '07:15': ['2'], '14:30': ['2'], '20:30': ['1']} time:id
             self.log.info(f"规范化后的账号时间为：{accounts_time}") 
             
@@ -241,7 +247,7 @@ class PaperAgent():
                         self.log.info(f'账号{account_id}要宣传的论文信息是：{paper_info}')
                         
                         # 初始化账号bot,获取操作对象、执行操作等
-                        bot = TwitterBot(log_path=f"./logs/{self.platform}/{account_id}/{self.platform}_log.log")  
+                        bot = get_bot_class(self.platform)(log_path=f"./logs/{self.platform}/{account_id}/{self.platform}_log.log")  
                         await bot.login_by_cookies(account_id=int(account_id))  # 登录账号
                         propaganda_results = await self.auto_paper_single_account(account_id=int(account_id),paper_info=paper_info,domain=domain,bot=bot)   # 账号运营
                         await asyncio.sleep(random.uniform(5,10))
