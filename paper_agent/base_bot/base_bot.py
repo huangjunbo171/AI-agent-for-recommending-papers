@@ -12,7 +12,7 @@ import requests
 import json
 import os
 from PIL import Image
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from utils.log import logger
 from config import DEFAULT_DRIVER_PATH
 from utils.proxy import create_proxyauth_extension,get_ip_port
@@ -215,6 +215,7 @@ class WebDriver():
     def _login(self, url: str = "https://weibo.com",cookies:list = None,token:str = None):
         "把cookie处理好，转到指定界面"
         try:
+            self.driver.set_page_load_timeout(45)
             self.driver.get(url=url)
             self.log.info("进入登录界面")
             time.sleep(5)
@@ -237,9 +238,23 @@ class WebDriver():
                 self.driver.get(url=url)
                 self.log.info("token加载成功，进入主页")
                 time.sleep(2)
+            return True
+        except TimeoutException as e:
+            try:
+                self.driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            self.log.error(str(e))
+            self.log.error("cookies加载失败")
+            return False
+        except WebDriverException as e:
+            self.log.error(str(e))
+            self.log.error("cookies加载失败")
+            return False
         except Exception as e:
             self.log.error(str(e))
-            self.log.error("cookies加载失败")        
+            self.log.error("cookies加载失败")
+            return False
     
     def close(self):
         self.driver.close()

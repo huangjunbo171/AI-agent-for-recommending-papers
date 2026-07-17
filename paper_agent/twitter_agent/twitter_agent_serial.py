@@ -99,6 +99,35 @@ class TwitterAgent():
     def _run_worker_sync(worker, kwargs):
         return asyncio.run(worker.auto_cultivation(**kwargs))
 
+    async def run_serial_accounts(self, account_ids, news=True, followings=True, url=None, model=None, topic_path=None, force_run_now=False, paper_mode=False, domain=None, paper_path=None, max_cycles=None, max_runtime_minutes=None):
+        self.log.info(f"准备串行运营账号: {account_ids}")
+        results = []
+        for account_id in account_ids:
+            worker = TwitterAgent(log_path=f"./logs/twitter/{account_id}/twitter_log.log")
+            worker_kwargs = {
+                "account_ids": [int(account_id)],
+                "news": news,
+                "followings": followings,
+                "url": url,
+                "model": model,
+                "topic_path": topic_path,
+                "force_run_now": force_run_now,
+                "paper_mode": paper_mode,
+                "domain": domain,
+                "paper_path": paper_path,
+                "max_cycles": max_cycles,
+                "max_runtime_minutes": max_runtime_minutes,
+            }
+            self.log.info(f"开始串行执行账号: {account_id}")
+            try:
+                result = await worker.auto_cultivation(**worker_kwargs)
+            except Exception as e:
+                self.log.error(f"账号 {account_id} 串行运行失败: {e}")
+                raise
+            results.append(result)
+            self.log.info(f"账号 {account_id} 已完成全部操作，继续下一个账号")
+        return results
+
     async def build_paper_info(self, paper, domain):
         paper_info = {
             "Title": paper["Title"],
@@ -132,32 +161,21 @@ class TwitterAgent():
         return account_ids
 
     async def run_parallel_accounts(self, account_ids, news=True, followings=True, url=None, model=None, topic_path=None, force_run_now=False, paper_mode=False, domain=None, paper_path=None, max_cycles=None, max_runtime_minutes=None):
-        self.log.info(f"准备并行运营账号: {account_ids}")
-        tasks = []
-        for account_id in account_ids:
-            worker = TwitterAgent(log_path=f"./logs/twitter/{account_id}/twitter_log.log")
-            worker_kwargs = {
-                "account_ids": [int(account_id)],
-                "news": news,
-                "followings": followings,
-                "url": url,
-                "model": model,
-                "topic_path": topic_path,
-                "force_run_now": force_run_now,
-                "paper_mode": paper_mode,
-                "domain": domain,
-                "paper_path": paper_path,
-                "max_cycles": max_cycles,
-                "max_runtime_minutes": max_runtime_minutes,
-            }
-            tasks.append(asyncio.to_thread(self._run_worker_sync, worker, worker_kwargs))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for account_id, result in zip(account_ids, results):
-            if isinstance(result, Exception):
-                self.log.error(f"账号 {account_id} 并行运行失败: {result}")
-                raise result
-        return results
+        # Keep the existing public method name, but execute accounts one by one.
+        return await self.run_serial_accounts(
+            account_ids=account_ids,
+            news=news,
+            followings=followings,
+            url=url,
+            model=model,
+            topic_path=topic_path,
+            force_run_now=force_run_now,
+            paper_mode=paper_mode,
+            domain=domain,
+            paper_path=paper_path,
+            max_cycles=max_cycles,
+            max_runtime_minutes=max_runtime_minutes,
+        )
 
     async def get_action_time(self,account_ids,url=None,history=None,current_time=None,is_predict=True):
         accounts = []
@@ -596,7 +614,7 @@ if __name__ == '__main__':
         agent.log.info(f"话题池文件不存在，跳过 topic 模式: {topic_path}")
         topic_path = None
     asyncio.run(
-        agent.run_parallel_accounts(
+        agent.run_serial_accounts(
             account_ids=account_ids,
             news=args.news,
             followings=args.followings,

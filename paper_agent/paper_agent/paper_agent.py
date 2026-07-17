@@ -82,6 +82,38 @@ class PaperAgent():
             return False
         return (time.monotonic() - start_ts) >= max_runtime_minutes * 60
 
+    def _has_any_action(self, action_counts: dict):
+        return any(count > 0 for count in (action_counts or {}).values())
+
+    def _post_paper_prompt(self, character: str, language: str, max_length: int):
+        if self.platform == 'xiaohongshu':
+            return xhs_post_paper_prompt(character=character,language=language,max_length=max_length)
+        return f'''
+You are writing as this social-media account persona:
+{character}
+
+Task:
+Write one publish-ready X/Twitter post recommending the provided academic paper.
+
+Rules:
+- Language: {language}.
+- Maximum length: {max_length} characters before the paper link is appended by the program.
+- Start with a concrete research angle, not generic praise.
+- Mention one specific contribution, method, finding, benchmark, or challenge from the paper.
+- Keep the tone natural, scholarly, and concise.
+- Do not include hashtags, @mentions, emojis, markdown, bullet lists, or extra explanations.
+- Do not include any URL; the program will append the paper link.
+- Output only the final post text.
+'''
+
+    def _paper_reference_text(self, paper_url: str):
+        if not paper_url:
+            return ""
+        match = re.search(r"arxiv\.org/(?:abs|pdf)/([0-9]+\.[0-9]+)(?:v\d+)?", paper_url, flags=re.IGNORECASE)
+        if match:
+            return f"arXiv:{match.group(1)}"
+        return ""
+
     def format_action_time(self, action_times):
         """将{"id":[time]}转换为{"time":[id]}"""
         # 创建一个空字典用于存储 time: [id]
@@ -374,7 +406,14 @@ class PaperAgent():
                         
                         # 初始化账号bot,获取操作对象、执行操作等
                         bot = get_bot_class(self.platform)(log_path=f"./logs/{self.platform}/{account_id}/{self.platform}_log.log")  
-                        await bot.login_by_cookies(account_id=int(account_id))  # 登录账号
+                        login_response = await bot.login_by_cookies(account_id=int(account_id))  # 登录账号
+                        if getattr(login_response, "status_code", None) != 200:
+                            self.log.error(f'账号{account_id} cookie 登录失败，跳过本轮论文运营')
+                            try:
+                                bot.driver.driver.quit()
+                            except Exception:
+                                pass
+                            continue
                         propaganda_results = await self.auto_paper_single_account(account_id=int(account_id),paper_info=paper_info,domain=domain,bot=bot)   # 账号运营
                         await asyncio.sleep(random.uniform(5,10))
                         if len(propaganda_results) !=  0 and paper_info.get('Paper_id') is not None:
@@ -584,13 +623,21 @@ class PaperAgent():
                         action_counts[action] += 1
                         await asyncio.sleep(random.uniform(3,10))
             
+            # Twitter 没有产生任何互动时，兜底主动发一篇当前选中的论文。
+            if self.platform == 'twitter' and not self._has_any_action(action_counts):
+                await asyncio.sleep(random.uniform(5,10))
+                self.log.info(f'账号{account_id}未执行任何互动操作，随机论文兜底主动发帖')
+                propaganda_result = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action='发帖',paper_info=paper_info)
+                if propaganda_result:
+                    propaganda_results.append(propaganda_result)
             # 每天再执行一次主动发帖？
-            if self.auto_post:
+            elif self.auto_post:
                 # 再执行一次主动发帖宣传论文
                 await asyncio.sleep(random.uniform(5,10))
                 self.log.info(f'账号{account_id}进行主动发帖')
                 propaganda_result = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action='发帖',paper_info=paper_info)
-                propaganda_results.append(propaganda_result)
+                if propaganda_result:
+                    propaganda_results.append(propaganda_result)
             self.log.info(f'账号已经执行完当前时间点的操作')
             return propaganda_results
         except Exception as e:
@@ -681,6 +728,15 @@ class PaperAgent():
         -paper_info : 论文信息
         -model : 模型名称
         '''
+        content_url = None
+        paper_info = paper_info or {}
+        paper_title = paper_info.get("Title") or "Untitled paper"
+        paper_abstract = paper_info.get("Abstract") or ""
+        paper_url = paper_info.get("URL") or ""
+        image_paths = paper_info.get("image_paths") or []
+        if isinstance(image_paths, str):
+            image_paths = [image_paths] if image_paths else []
+        gene_keywords = paper_info.get("Gene_keywords") or []
         try:
             # 检索 该账号是否对该贴文进行了action操作，如果操作过了就不再继续操作v
             if published:
@@ -728,7 +784,7 @@ class PaperAgent():
                         ]
 
                         content += random.choice(links)
-                file_paths = random.choice([paper_info["image_paths"],[]])  # 评论推荐论文的时候 可加图片可不加图片
+                file_paths = random.choice([image_paths,[]])  # 评论推荐论文的时候 可加图片可不加图片
                 if action == '转发':
                     response = await bot.transmits(account_id=int(account_id),url=published["note_url"],content=content,file_paths=file_paths) 
                     content_url  =  json.loads(response.body.decode()).get("response").split('成功：')[-1]
@@ -754,25 +810,41 @@ class PaperAgent():
                 await bot.collects(account_id=int(account_id),url=published["note_url"])
                 content_url = None
             elif action == '发帖':  # 主动发帖宣传论文
-                text = f'\n论文标题是: {paper_info["Title"]} \n论文摘要是: {paper_info["Abstract"]}' 
-                _,content = await general_generation_think([{"role": "system", "content": post_paper_prompt(character=character,language=self.language,max_length=self.max_length)},{"role": "user", "content": text}])    
+                text = f'\n论文标题是: {paper_title} \n论文摘要是: {paper_abstract}' 
+                _,content = await general_generation_think([{"role": "system", "content": self._post_paper_prompt(character=character,language=self.language,max_length=self.max_length)},{"role": "user", "content": text}])    
                 self.log.info(f'模型生成的发帖内容是：{content}')
-                content = ''.join(c for c in content if ord(c) <= 0xFFFF) 
-                content = self.cut_content(content,max_length=self.max_length)
-                content += paper_info["URL"]
+                if not content:
+                    content = f"Interesting paper: {paper_title}"
+                    if paper_abstract:
+                        content += f". {paper_abstract}"
+                content = ''.join(c for c in str(content) if ord(c) <= 0xFFFF).strip()
+                reference_text = self._paper_reference_text(paper_url)
+                suffix_parts = []
+                if reference_text and reference_text.lower() not in content.lower():
+                    suffix_parts.append(reference_text)
+                if paper_url and paper_url not in content:
+                    suffix_parts.append(paper_url)
+                suffix = " ".join(suffix_parts).strip()
+                if suffix:
+                    content = self.cut_content(content,max_length=max(1,self.max_length-len(suffix)-1))
+                    content = f"{content} {suffix}".strip()
+                else:
+                    content = self.cut_content(content,max_length=self.max_length)
                 self.log.info(f'经过字数检查之后要发帖的内容是：{content}')
                 if self.platform  == 'twitter':
-                    response = await bot.posts(account_id=int(account_id),content=content,file_paths=paper_info['image_paths'])
+                    response = await bot.posts(account_id=int(account_id),content=content,file_paths=image_paths)
                     content_url  =  json.loads(response.body.decode()).get("response").split('成功：')[-1]
                 if self.platform  == 'xiaohongshu':
-                    await bot.posts(account_id=int(account_id),content=content,file_paths=paper_info['image_paths'],tags=paper_info['Gene_keywords'])
+                    await bot.posts(account_id=int(account_id),content=content,file_paths=image_paths,tags=gene_keywords)
             # 在该页面进行浏览
             bot.scroll(duration=random.uniform(8,15))
             await asyncio.sleep(random.uniform(10,20))
 
             return {content_url:action} if content_url else None
         except Exception as e:
-            self.log.error(f'账号对{published["note_url"]}进行{action}的时候出错，原因是：{e}')
+            target_url = published.get("note_url") if isinstance(published, dict) else "主动发帖"
+            self.log.error(f'账号对{target_url}进行{action}的时候出错，原因是：{e}')
+            return None
    
 
     async def get_account_character(self,account_id):

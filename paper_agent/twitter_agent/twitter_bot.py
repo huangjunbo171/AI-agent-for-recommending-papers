@@ -36,6 +36,14 @@ try:
     from twitter_agent.twitter_request import create_response
 except ModuleNotFoundError:
     from twitter_request import create_response
+try:
+    from twitter_agent.cookie_login_patch import cookie_only_login_by_cookies as patched_cookie_login_by_cookies
+except ModuleNotFoundError:
+    from cookie_login_patch import cookie_only_login_by_cookies as patched_cookie_login_by_cookies
+try:
+    from base_bot.finger_generation import FingerprintPersistence
+except ModuleNotFoundError:
+    from finger_generation import FingerprintPersistence
 from datetime import datetime, timezone, timedelta
 class TwitterBot():
     def __init__(self, log_path: str = "./logs/twitter/twitter_log.log"):
@@ -52,7 +60,13 @@ class TwitterBot():
         self.log_path = log_path
         self.use_proxy = True
         self.headless = True
-        self.driver = WebDriver(log_path=log_path,use_proxy=self.use_proxy ,headless=self.headless)   # ,headless=True
+        self.fingerprint = None
+        self.driver = WebDriver(
+            log_path=log_path,
+            use_proxy=self.use_proxy,
+            headless=self.headless,
+            fingerprint=self.fingerprint,
+        )   # ,headless=True
         self.log = logger(filename=log_path)
         self.database = sql_dataset('twitter')
 
@@ -63,17 +77,54 @@ class TwitterBot():
         except Exception:
             return False
 
-    def _rebuild_driver(self):
+    def _rebuild_driver(self, fingerprint=None):
         try:
             self.driver.driver.quit()
         except Exception:
             pass
+        if fingerprint is not None:
+            self.fingerprint = fingerprint
         self.driver = WebDriver(
             log_path=self.log_path,
             use_proxy=self.use_proxy,
             headless=self.headless,
+            fingerprint=self.fingerprint,
         )
         self.log.info("webdriver 会话失活，已重建浏览器驱动")
+
+    def _load_account_fingerprint(self, account_id):
+        try:
+            result = self.database.get_dict_data_sql(
+                f"SELECT FingerPrint FROM accounts_info WHERE Account_id = {int(account_id)}"
+            )
+            if result:
+                raw_fp = result[0].get("FingerPrint")
+                if isinstance(raw_fp, dict):
+                    return raw_fp, "db"
+                if isinstance(raw_fp, str) and raw_fp.strip():
+                    return json.loads(raw_fp), "db"
+        except Exception as e:
+            self.log.info(f"账号{account_id}从数据库读取 FingerPrint 失败，原因是：{e}")
+
+        try:
+            local_fingerprints = FingerprintPersistence.load_from_json()
+            local_fp = local_fingerprints.get(int(account_id))
+            if local_fp:
+                return local_fp, "local_json"
+        except Exception:
+            pass
+
+        return None, None
+
+    def _prepare_account_driver(self, account_id):
+        fingerprint, source = self._load_account_fingerprint(account_id)
+        if fingerprint == self.fingerprint:
+            return
+        self._rebuild_driver(fingerprint=fingerprint)
+        if fingerprint:
+            self.log.info(f"账号{account_id}已加载浏览器指纹，来源：{source}")
+        else:
+            self.log.info(f"账号{account_id}未找到浏览器指纹，使用默认浏览器配置")
 
     async def _ensure_live_driver(self, account_id=None, force_reset=False, url: str = "https://twitter.com/?lang=zh"):
         if force_reset or not self._driver_session_alive():
@@ -191,32 +242,50 @@ class TwitterBot():
                     return href
         return None
 
+    def _has_logged_in_ui(self):
+        strict_logged_in_markers = [
+            '//button[@data-testid="SideNav_AccountSwitcher_Button"]',
+            '//a[@data-testid="SideNav_NewTweet_Button"]',
+            '//button[@data-testid="SideNav_NewTweet_Button"]',
+            '//a[@href="/compose/post"]',
+            '//a[@data-testid="AppTabBar_Profile_Link"]',
+        ]
+        for xpath in strict_logged_in_markers:
+            try:
+                if self.driver.find_xpaths(XPATH=xpath):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _cookie_login_state(self, expected_profile: str = None, account: str = None):
         profile_href = self._extract_profile_href()
         try:
             current_url = self.driver.driver.current_url or ""
         except Exception:
             current_url = ""
+        parsed_current = urlparse(current_url)
         normalized_current = current_url.rstrip("/").lower()
+        current_host = (parsed_current.netloc or "").lower().removeprefix("www.")
+        current_path = (parsed_current.path or "").lower()
 
-        logged_in_markers = [
-            '//button[@data-testid="SideNav_AccountSwitcher_Button"]',
-            '//a[@data-testid="AppTabBar_Home_Link"]',
-            '//a[@href="/compose/post"]',
-            '//div[@data-testid="primaryColumn"]',
+        has_logged_in_ui = self._has_logged_in_ui()
+        login_form_markers = [
+            '//input[@name="text" and @autocomplete="username"]',
+            '//input[@name="password"]',
+            '//button[@data-testid="LoginForm_Login_Button"]',
+            '//button[@data-testid="ocfEnterTextNextButton"]',
+            '//a[contains(@href,"/i/flow/login")]',
         ]
-        has_logged_in_ui = any(self.driver.find_xpaths(XPATH=xpath) for xpath in logged_in_markers)
-        has_login_form = bool(self.driver.find_xpaths(XPATH='//input[@name="text"]')) or bool(
-            self.driver.find_xpaths(XPATH='//a[contains(@href,"/i/flow/login")]')
-        )
+        has_login_form = any(self.driver.find_xpaths(XPATH=xpath) for xpath in login_form_markers)
+        in_login_flow = "/i/flow/login" in current_path
+        on_x_domain = current_host in {"x.com", "twitter.com"}
 
-        if profile_href and self._profile_url_matches(profile_href, expected_profile, account):
+        if has_logged_in_ui and not has_login_form and not in_login_flow:
             return True, profile_href, current_url
-        if not expected_profile and profile_href:
+        if on_x_domain and "/compose/post" in normalized_current and not has_login_form:
             return True, profile_href, current_url
-        if has_logged_in_ui and not has_login_form and ("/home" in normalized_current or normalized_current in {"https://x.com", "https://twitter.com"}):
-            return True, profile_href, current_url
-        if expected_profile and not has_login_form and self._profile_url_matches(current_url, expected_profile, account):
+        if has_logged_in_ui and profile_href and self._profile_url_matches(profile_href, expected_profile, account):
             return True, profile_href, current_url
         return False, profile_href, current_url
         
@@ -272,53 +341,7 @@ class TwitterBot():
                 
     async def login_by_cookies(self, account_id :int, url: str = "https://twitter.com/?lang=zh"):
         '''使用cookies登录账号'''
-        create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            search_sql = f"SELECT * FROM accounts_info WHERE accounts_info.Account_id = {account_id}"
-            result = self.database.get_dict_data_sql(search_sql)[0]
-            self.log.info("从数据库中获取到的账号信息:{}".format(result))
-            cookies = result['Cookie']
-            token = result['Token']
-            ct0 = result['Ct0']
-            profile = result['URL']  # 主页链接
-        except Exception as e:
-            self.log.error("获取账号信息失败，原因：{}".format(e))
-            # raise Exception("获取账号信息失败")
-            return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}cookies下线，利用cookies登录失败')
-        try:
-            
-            if cookies:
-                cookies = json.loads(cookies)
-            else:
-                cookies = [{"name": "auth_token", "path": "/", "value": token, "domain": ".x.com", "expiry": 1785316008, "secure": True, "httpOnly": True, "sameSite": "None"},{"name": "ct0", "path": "/", "value": ct0, "domain": ".x.com", "expiry": 1785316009, "secure": True, "httpOnly": False, "sameSite": "Lax"}]
-            self.driver._login(url="https://x.com/home",cookies=cookies,token=token)
-            #检查是否登录成功,是否包含帐号
-            time.sleep(random.uniform(5,8))
-            # 刷新页面
-            # 检查是否登录成功，是否包含账号
-            href_candidates = self.driver.find_xpaths(XPATH='//a[@aria-label="Profile"]')
-            href = href_candidates[-1].get_attribute("href") if href_candidates else None
-            login_ok = self._cookie_login_state(expected_profile=profile, account=account)[0]
-            if profile and href and not self._profile_url_matches(href, profile, account) and not login_ok:
-                self.log.info(f"数据库中的主页链接为{profile}，当前的主页链接为{href}，不一致")
-                sql = '''UPDATE accounts_info SET Cookie_Status = %s WHERE Account_id = %s;'''
-                self.database.operation(sql,('下线',account_id))
-                time.sleep(random.uniform(2,4))
-                self.log.error(f'账号{account_id}cookies下线，利用cookies登录失败')
-                # raise ValueError  # 抛出异常
-                return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}cookies下线，利用cookies登录失败')
-            else:
-                self.log.info("利用cookies登录成功")
-                sql = '''UPDATE accounts_info SET Latest_login_time = %s WHERE Account_id = %s;'''
-                self.database.operation(sql,(datetime.now(),account_id))
-                await self.get_user_profile(account_id=account_id)
-                return create_response(create_time=create_time,code=HTTPStatus.OK,message='success',response=f'账号{account_id}cookies登录成功')    
-        except:
-            sql = '''UPDATE accounts_info SET Cookie_Status = %s WHERE Account_id = %s;'''
-            self.database.operation(sql,('下线',account_id))
-            time.sleep(random.uniform(2,4))
-            self.log.error(f'账号{account_id}cookies下线，利用cookies登录失败')   
-            return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}cookies下线，利用cookies登录失败')
+        return await patched_cookie_login_by_cookies(self, account_id=account_id, url=url)
     
       
     async def login_by_verificationcode(self, account_id = None, code=None, url: str = "https://twitter.com/?lang=zh", ):
@@ -668,8 +691,60 @@ class TwitterBot():
         '''发帖'''
         try:
             create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if 'https://x.com/' not in self.driver.driver.current_url:
-                await self.login_by_cookies(account_id=account_id)
+            search_sql = f"SELECT * FROM accounts_info WHERE accounts_info.Account_id = {account_id}"
+            account_result = self.database.get_dict_data_sql(search_sql)[0]
+            expected_profile = account_result.get("URL")
+            account_name = account_result.get("Account")
+            compose_open_xpaths = [
+                '//a[@data-testid="SideNav_NewTweet_Button"]',
+                '//button[@data-testid="SideNav_NewTweet_Button"]',
+                '//button[@data-testid="tweetButton"]',
+            ]
+            textbox_xpaths = [
+                '//div[@data-testid="tweetTextarea_0RichTextInputContainer"]',
+                '//div[@data-testid="tweetTextarea_0_label"]',
+                '//div[@data-testid="tweetTextarea_0"]',
+                '//div[@role="textbox" and @contenteditable="true"]',
+                '//div[@role="textbox"]',
+            ]
+            input_xpaths = [
+                '//div[@data-testid="tweetTextarea_0"]',
+                '//div[@role="textbox" and @contenteditable="true"]',
+                '//div[@class="public-DraftStyleDefault-block public-DraftStyleDefault-ltr"]',
+            ]
+
+            def _compose_ui_ready():
+                for xpath in compose_open_xpaths + textbox_xpaths:
+                    try:
+                        if self.driver.find_xpaths(XPATH=xpath):
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            current_url = self.driver.driver.current_url or ""
+            login_ok = False
+            if 'https://x.com/' in current_url or 'https://twitter.com/' in current_url:
+                login_ok = self._cookie_login_state(expected_profile=expected_profile, account=account_name)[0]
+            if not login_ok:
+                login_response = await self.login_by_cookies(account_id=account_id)
+                if getattr(login_response, "status_code", None) != 200:
+                    self.log.error(f'账号{account_id}twitter内容发布失败，原因是：cookie login failed')
+                    return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}发布失败')
+                self.driver.get(url='https://x.com/home')
+                time.sleep(random.uniform(3,5))
+                login_ok = self._cookie_login_state(expected_profile=expected_profile, account=account_name)[0]
+                if not login_ok:
+                    login_ok = _compose_ui_ready()
+                if not login_ok:
+                    self.driver.get(url='https://x.com/compose/post')
+                    time.sleep(random.uniform(3,5))
+                    login_ok = self._cookie_login_state(expected_profile=expected_profile, account=account_name)[0]
+                    if not login_ok:
+                        login_ok = _compose_ui_ready()
+            if not login_ok:
+                self.log.error(f'账号{account_id}twitter内容发布失败，原因是：not logged in')
+                return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}发布失败')
             
 
             # 消除BMP字符
@@ -677,9 +752,44 @@ class TwitterBot():
             note_type = '原创'
             self.driver.get(url='https://twitter.com/home')
             time.sleep(random.uniform(3,5))
+
             self.log.info("点击文本框")
-            self.driver.search_and_click(XPATH='//div[@data-testid="tweetTextarea_0_label"]',waiting_time=1.0) # 点一下激活输入框
-            self.driver.send_content(XPATH='//div[@class="public-DraftStyleDefault-block public-DraftStyleDefault-ltr"]',content = content)
+            textbox_ready = False
+            for xpath in textbox_xpaths:
+                try:
+                    self.driver.find_xpath(XPATH=xpath).click()
+                    textbox_ready = True
+                    break
+                except Exception:
+                    continue
+            if not textbox_ready:
+                for xpath in compose_open_xpaths:
+                    try:
+                        self.driver.find_xpath(XPATH=xpath).click()
+                        time.sleep(random.uniform(1,2))
+                        break
+                    except Exception:
+                        continue
+                for xpath in textbox_xpaths:
+                    try:
+                        self.driver.find_xpath(XPATH=xpath).click()
+                        textbox_ready = True
+                        break
+                    except Exception:
+                        continue
+            if not textbox_ready:
+                raise Exception("XPATH not found")
+
+            input_ready = False
+            for xpath in input_xpaths:
+                try:
+                    self.driver.find_xpath(XPATH=xpath).send_keys(content)
+                    input_ready = True
+                    break
+                except Exception:
+                    continue
+            if not input_ready:
+                raise Exception("XPATH not found")
             time.sleep(random.uniform(5,8))
             if file_paths:
                 self.log.info("上传图片/视频")
@@ -687,7 +797,19 @@ class TwitterBot():
                 time.sleep(random.uniform(5,10))
             action_time = datetime.now()
             self.log.info(f'点击发帖按钮')
-            self.driver.search_and_click(XPATH="//button[@role = 'button' and @data-testid='tweetButtonInline']")#点击发帖
+            publish_clicked = False
+            for xpath in [
+                "//button[@role = 'button' and @data-testid='tweetButtonInline']",
+                "//button[@data-testid='tweetButton']",
+            ]:
+                try:
+                    self.driver.search_and_click(XPATH=xpath,waiting_time=2.0)
+                    publish_clicked = True
+                    break
+                except Exception:
+                    continue
+            if not publish_clicked:
+                raise Exception("XPATH not found")
             self.log.info("twitter帖子发布成功")
             try:
                 self.driver.find_xpath(XPATH='//div[@class="css-175oi2r r-1awozwy r-16y2uox"]')
