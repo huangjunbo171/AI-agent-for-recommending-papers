@@ -62,7 +62,7 @@ class PaperAgent():
             self.posts =True
             self.persons=True
             self.communities=True
-            self.auto_post=False # 主动发帖
+            self.auto_post=True # 主动发帖
         elif self.platform == 'xiaohongshu':
             self.action_limits = {"点赞": 10, "收藏": 10, "评论": 10, "关注": 5}   # 操作上限
             self.language = '中文'
@@ -243,6 +243,187 @@ Rules:
             return matched
         self.log.info(f"本地论文未严格匹配领域 {domain}，回退使用全部 {len(papers)} 篇本地论文")
         return papers
+
+    def _paper_text_tokens(self, *parts):
+        text = " ".join(str(part or "") for part in parts).lower()
+        stopwords = {
+            "the", "and", "for", "with", "from", "that", "this", "into", "using",
+            "towards", "through", "based", "via", "are", "our", "their", "your",
+            "about", "have", "has", "into", "than", "over", "under", "between",
+            "model", "models", "paper", "papers", "study", "studies",
+        }
+        return {
+            token for token in re.findall(r"[a-z0-9]+", text)
+            if len(token) > 2 and token not in stopwords
+        }
+
+    def _normalize_reply_strategy(self, raw_strategy):
+        text = str(raw_strategy or "").strip()
+        if "同领域" in text or "多篇" in text:
+            return "同领域多篇推荐"
+        if "问题" in text or "解决" in text:
+            return "问题解决型推荐"
+        if "直接" in text:
+            return "直接推荐"
+        if "互动" in text:
+            return "互动+推荐"
+        return "互动+推荐"
+
+    def _rank_related_reply_papers(self, anchor_paper: dict, candidates: list, domain: str = None, limit: int = 2):
+        anchor_title = str((anchor_paper or {}).get("Title") or "").strip().lower()
+        anchor_tokens = self._paper_text_tokens(
+            (anchor_paper or {}).get("Title"),
+            (anchor_paper or {}).get("Abstract"),
+        )
+        scored = []
+        for index, paper in enumerate(candidates or []):
+            title = str((paper or {}).get("Title") or "").strip()
+            if not title or title.lower() == anchor_title:
+                continue
+            paper_tokens = self._paper_text_tokens(paper.get("Title"), paper.get("Abstract"))
+            overlap = len(anchor_tokens & paper_tokens)
+            score = overlap * 10
+            if domain and self._paper_matches_domain(paper, domain=domain):
+                score += 3
+            if paper.get("Abstract"):
+                score += 1
+            scored.append((score, index, paper))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        ranked = [paper for _, _, paper in scored[:limit]]
+        if len(ranked) >= limit:
+            return ranked
+
+        seen_titles = {str(paper.get("Title") or "").strip().lower() for paper in ranked}
+        for paper in candidates or []:
+            title = str((paper or {}).get("Title") or "").strip().lower()
+            if not title or title == anchor_title or title in seen_titles:
+                continue
+            ranked.append(paper)
+            seen_titles.add(title)
+            if len(ranked) >= limit:
+                break
+        return ranked
+
+    def _query_same_domain_papers(self, domain: str, exclude_title: str = None, limit: int = 6):
+        if not domain:
+            return []
+        domain_sql = domain.replace("'", "''")
+        title_filter = ""
+        if exclude_title:
+            title_sql = exclude_title.replace("'", "''")
+            title_filter = f" AND Title <> '{title_sql}'"
+        sql = (
+            "SELECT Paper_id, Title, Abstract, URL "
+            "FROM papers_info "
+            f"WHERE JSON_CONTAINS(Field, JSON_QUOTE('{domain_sql}'), '$') "
+            "AND Title IS NOT NULL AND Title != '' "
+            "AND Abstract IS NOT NULL AND Abstract != ''"
+            f"{title_filter} "
+            "ORDER BY Paper_id DESC "
+            f"LIMIT {max(limit, 6)};"
+        )
+        try:
+            return self.paper_database.get_dict_data_sql(sql=sql) or []
+        except Exception as e:
+            self.log.info(f"查询同领域额外论文失败，改为本地候选兜底：{e}")
+            return []
+
+    def _get_same_domain_papers_for_reply(self, anchor_paper: dict, domain: str = None, limit: int = 2):
+        candidates = []
+        seen_titles = set()
+
+        for paper in self._query_same_domain_papers(
+            domain=domain,
+            exclude_title=(anchor_paper or {}).get("Title"),
+            limit=max(limit * 3, 6),
+        ):
+            title = str((paper or {}).get("Title") or "").strip().lower()
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            candidates.append(paper)
+
+        local_papers = self.get_local_paper_candidates(domain=domain)
+        for paper in local_papers:
+            title = str((paper or {}).get("Title") or "").strip().lower()
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            candidates.append(paper)
+
+        return self._rank_related_reply_papers(
+            anchor_paper=anchor_paper,
+            candidates=candidates,
+            domain=domain,
+            limit=limit,
+        )
+
+    def _format_extra_papers_for_prompt(self, papers: list):
+        lines = []
+        for index, paper in enumerate(papers or [], start=1):
+            title = str((paper or {}).get("Title") or "").strip()
+            abstract = str((paper or {}).get("Abstract") or "").strip()
+            if not title:
+                continue
+            abstract = abstract.replace("\n", " ").strip()
+            abstract = abstract[:240]
+            lines.append(f"{index}. {title}\n摘要线索：{abstract}")
+        return "\n\n".join(lines)
+
+    async def _select_reply_strategy(self, post_text: str, paper_info: dict):
+        _, response = await general_generation_think([
+            {"role": "system", "content": paper_reply_strategy_system_prompt()},
+            {
+                "role": "user",
+                "content": paper_reply_strategy_user_prompt(
+                    post_text=post_text,
+                    paper_title=paper_info.get("Title") or "",
+                    paper_abstract=paper_info.get("Abstract") or "",
+                ),
+            },
+        ])
+        strategy = self._normalize_reply_strategy(response)
+        self.log.info(f'推荐回复策略判断结果为：{response}，归一化后的策略是：{strategy}')
+        return strategy
+
+    async def _generate_strategy_reply(self, character: str, published: dict, paper_info: dict, domain: str = None):
+        strategy = await self._select_reply_strategy(
+            post_text=published.get("content") or "",
+            paper_info=paper_info,
+        )
+        extra_papers = []
+        if strategy == "同领域多篇推荐":
+            extra_papers = self._get_same_domain_papers_for_reply(
+                anchor_paper=paper_info,
+                domain=domain,
+                limit=2,
+            )
+            if not extra_papers:
+                self.log.info("未获取到足够的同领域额外论文，回退为互动+推荐策略")
+                strategy = "互动+推荐"
+
+        content = await general_generation_deepseek([
+            {
+                "role": "system",
+                "content": paper_reply_generation_system_prompt(
+                    character=character,
+                    strategy=strategy,
+                    language=self.language,
+                    max_length=min(220, max(120, self.max_length - 50)),
+                ),
+            },
+            {
+                "role": "user",
+                "content": paper_reply_generation_user_prompt(
+                    post_text=published.get("content") or "",
+                    paper_title=paper_info.get("Title") or "",
+                    paper_abstract=paper_info.get("Abstract") or "",
+                    extra_papers_text=self._format_extra_papers_for_prompt(extra_papers),
+                ),
+            },
+        ])
+        return strategy, content
 
 
     async def predict_action_time(self,account_id):
@@ -546,7 +727,7 @@ Rules:
                         if action == 'None':
                             return propaganda_results  # 动作达到上限，此时间段不再执行任何动作
                         self.log.info(f'此时间段已经执行过的动作是: {action_counts}， 对当前帖子要执行的动作是：{action}')
-                        propaganda_result = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action=action,published=post_info,paper_info=paper_info) # 执行动作
+                        propaganda_result = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action=action,published=post_info,paper_info=paper_info,domain=domain) # 执行动作
                         propaganda_results.append(propaganda_result)
                         if action == '仅评论'  or action == '仅转发':
                             action = self.action_alias[action]
@@ -579,7 +760,7 @@ Rules:
                         if not action: continue
                         elif action == 'None': return propaganda_results# 动作达到上限不再继续操作
                         self.log.info(f'此时间段已经执行过的动作是: {action_counts}， 对当前帖子要执行的动作是：{action}')
-                        propaganda_result  = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action=action,published=post_info,paper_info=paper_info) # 执行动作
+                        propaganda_result  = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action=action,published=post_info,paper_info=paper_info,domain=domain) # 执行动作
                         propaganda_results.append(propaganda_result)
                         if action == '仅评论'  or action == '仅转发':
                             action = self.action_alias[action]
@@ -617,7 +798,7 @@ Rules:
                         if not action: continue
                         elif action == 'None': return propaganda_results
                         self.log.info(f'此时间段已经执行过的动作是: {action_counts}， 对当前帖子要执行的动作是：{action}')
-                        propaganda_result = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action=action,published=post_info,paper_info=paper_info) # 执行动作
+                        propaganda_result = await self.dispatch_action(bot=bot,account_id=account_id,character=character,action=action,published=post_info,paper_info=paper_info,domain=domain) # 执行动作
                         propaganda_results.append(propaganda_result)
                         action = self.action_alias[action] if action == '仅评论'  or action == '仅转发' else action
                         action_counts[action] += 1
@@ -717,7 +898,7 @@ Rules:
 
 
 
-    async def dispatch_action(self,bot,account_id,character:str,action:str,paper_info:dict,published:dict=None):
+    async def dispatch_action(self,bot,account_id,character:str,action:str,paper_info:dict,published:dict=None,domain:str=None):
         '''
         根据动作 进行相关操作
         -bot:
@@ -756,8 +937,28 @@ Rules:
                 if action == '评论' or action == '转发':      # 转发/评论过程中，也要推荐自己的论文
                     # CONTENT = f'''贴文内容:\n {published["content"]} \n\n 论文摘要: \n {paper_info["Abstract"]}'''
                     # _,content = await general_generation_think([{"role": "system", "content": paper_transmit_commment_prompt(character=character,language=self.language)},{"role": "user", "content": CONTENT}])
-                    content = await general_generation_deepseek([{"role": "system", "content": system_comment_and_paper_chinese},
-                                                                {"role": "user", "content": user_comment_and_paper_chinese.format(character=character,post_text=published["content"],paper_title=paper_info["Title"],paper_abstract=paper_info["Abstract"],language=self.language)}])
+                    strategy, content = await self._generate_strategy_reply(
+                        character=character,
+                        published=published,
+                        paper_info=paper_info,
+                        domain=domain,
+                    )
+                    self.log.info(f'当前{action}采用的论文推荐策略是：{strategy}')
+                    if not content:
+                        self.log.info('策略化回复生成为空，回退到原始单篇论文推荐 prompt')
+                        content = await general_generation_deepseek([
+                            {"role": "system", "content": system_comment_and_paper_chinese},
+                            {
+                                "role": "user",
+                                "content": user_comment_and_paper_chinese.format(
+                                    character=character,
+                                    post_text=published["content"],
+                                    paper_title=paper_info["Title"],
+                                    paper_abstract=paper_info["Abstract"],
+                                    language=self.language,
+                                ),
+                            },
+                        ])
                 self.log.info(f'模型生成的{action}内容是：{content}')
                 # 检查生成的内容是否符合人设，进行反思改写
                 think,content = await general_generation_think([{"role": "system", "content": system_reflective_rewrite_chinese},

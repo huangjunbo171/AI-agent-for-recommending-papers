@@ -70,6 +70,17 @@ class TwitterBot():
         self.log = logger(filename=log_path)
         self.database = sql_dataset('twitter')
 
+    def _normalize_file_paths(self, file_paths):
+        normalized_paths = []
+        for file_path in file_paths or []:
+            if not file_path:
+                continue
+            normalized_path = os.path.abspath(file_path)
+            if not os.path.exists(normalized_path):
+                self.log.info(f'上传媒体文件不存在，仍尝试使用绝对路径上传：{normalized_path}')
+            normalized_paths.append(normalized_path)
+        return normalized_paths
+
     def _driver_session_alive(self):
         try:
             _ = self.driver.driver.current_url
@@ -791,10 +802,13 @@ class TwitterBot():
             if not input_ready:
                 raise Exception("XPATH not found")
             time.sleep(random.uniform(5,8))
+            file_paths = self._normalize_file_paths(file_paths) if file_paths else file_paths
             if file_paths:
                 self.log.info("上传图片/视频")
                 self.driver.send_content(XPATH="//input[@data-testid = 'fileInput']", content = '\n'.join(file_paths))#上传图片/视频）
                 time.sleep(random.uniform(5,10))
+            if file_paths:
+                file_paths = self._normalize_file_paths(file_paths)
             action_time = datetime.now()
             self.log.info(f'点击发帖按钮')
             publish_clicked = False
@@ -1082,6 +1096,7 @@ class TwitterBot():
             self.log.info("输入评论内容")
             self.driver.send_content(XPATH='//div[@class="public-DraftStyleDefault-block public-DraftStyleDefault-ltr"]',content = content)
             time.sleep(random.uniform(3,5))
+            file_paths = self._normalize_file_paths(file_paths) if file_paths else file_paths
             if file_paths:
                 self.log.info("上传图片/视频")
                 self.driver.send_content(XPATH="//input[@data-testid = 'fileInput']", content = '\n'.join(file_paths))#上传图片/视频）
@@ -1197,6 +1212,7 @@ class TwitterBot():
                 self.driver.search_and_click(XPATH='//a[@role="menuitem"]',waiting_time=1.0)
                 self.log.info("点击quote转发按钮")
                 self.driver.send_content(XPATH='//div[@class="public-DraftStyleDefault-block public-DraftStyleDefault-ltr"]/span[1]',content=content)
+                file_paths = self._normalize_file_paths(file_paths) if file_paths else file_paths
                 if file_paths:
                     self.log.info("上传图片/视频")
                     self.driver.send_content(XPATH="//input[@data-testid = 'fileInput']", content = '\n'.join(file_paths))#上传图片/视频）

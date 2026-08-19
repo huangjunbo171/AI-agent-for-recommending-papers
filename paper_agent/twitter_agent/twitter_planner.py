@@ -1,4 +1,6 @@
 # from bot.twitter_bot import TwitterBot
+import ast
+import re
 import sys
 # sys.path.append("D:\\Desktop\\jmrh")
 import os
@@ -34,6 +36,67 @@ class TwitterPlanner:
         self.log = logger(filename=self.log_path)
         self.database = sql_dataset('twitter')
         # self.bot = TwitterBot()
+
+    @staticmethod
+    def _strip_code_fence(text):
+        text = str(text or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json|python)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
+        return text.strip()
+
+    def _parse_llm_dict_response(self, response, required_keys=None):
+        text = self._strip_code_fence(response)
+        if text in ("", "{}", "None", "null"):
+            return {}
+
+        normalized = (
+            text.replace("“", '"')
+            .replace("”", '"')
+            .replace("‘", "'")
+            .replace("’", "'")
+        )
+
+        for candidate in (text, normalized):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            try:
+                parsed = ast.literal_eval(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+
+        if required_keys:
+            recovered = {}
+            for key in required_keys:
+                quoted_match = re.search(
+                    rf'"{re.escape(key)}"\s*:\s*"(?P<value>.*?)"\s*(?:,|\}})',
+                    normalized,
+                    flags=re.DOTALL,
+                )
+                if quoted_match:
+                    recovered[key] = quoted_match.group("value").strip()
+                    continue
+
+                raw_match = re.search(
+                    rf'"{re.escape(key)}"\s*:\s*(?P<value>.*?)\s*(?:,|\}})',
+                    normalized,
+                    flags=re.DOTALL,
+                )
+                if raw_match:
+                    value = raw_match.group("value").strip().strip('"').strip("'")
+                    if value:
+                        recovered[key] = value
+
+            if recovered:
+                return recovered
+
+        raise ValueError(f"无法解析模型输出为字典: {text}")
 
     async def get_topics_information(self,topic_path=None):
         '''获取话题池,用于星云大师'''
@@ -94,9 +157,15 @@ class TwitterPlanner:
                     break  # 不再查找下一个日期
             if len(target_information) == 0: # 不存在文件，则到主页爬取
                 # 检查是否是目标人物的链接
-                with open('./data/target_url.txt', 'r', encoding='utf-8') as file:
-                    targets = file.readlines()  
+                target_urls_path = './data/target_url.txt'
+                targets = []
+                if os.path.exists(target_urls_path):
+                    with open(target_urls_path, 'r', encoding='utf-8') as file:
+                        targets = [result.strip() for result in file.readlines() if result.strip()]
                     targets = [result.strip() for result in targets]  # 去除每行末尾的换行符
+                else:
+                    self.log.info(f'未找到 {target_urls_path}，回退为直接从关注列表抓取目标人物帖子')
+                    targets = [following]
                 if following in targets:
                     os.makedirs(f'./information/followings/targets/{nickname}/{current_date}',exist_ok=True)
                     save_path = f'./information/followings/targets/{nickname}/{current_date}/posts.json'
@@ -163,7 +232,7 @@ class TwitterPlanner:
                     try:
                         response = await general_generation([{"role":"system","content":filter_prompt},{"role":"user","content":information['content']}])
                         self.log.info(f"判断是否感兴趣内容生成结果为：{response}")
-                        response = eval(response)
+                        response = self._parse_llm_dict_response(response, required_keys=["summary"])
                         if response:
                             information.update(response)
                             # self.log.info(f"获取的感兴趣的信息为：{information}")
@@ -204,7 +273,7 @@ class TwitterPlanner:
                 try:
                     response = await general_generation([{"role":"system","content":prompt},{"role":"user","content":information['content']}])
                     self.log.info(f"判断是否感兴趣内容生成结果为：{response}")
-                    response = eval(response)
+                    response = self._parse_llm_dict_response(response, required_keys=["summary"])
                     if response:
                         interested_information.append(information)
                         os.makedirs(f"./information/interests/{account_id}", exist_ok=True)
@@ -369,7 +438,7 @@ class TwitterPlanner:
                     try:
                         response = await general_generation([{"role":"system","content":filter_prompt},{"role":"user","content":information['content']}])
                         self.log.info(f"判断是否感兴趣内容生成结果为：{response}")
-                        response = eval(response)
+                        response = self._parse_llm_dict_response(response, required_keys=["summary"])
                         if response:  
                             information.update(response)
                             # self.log.info(f"获取的感兴趣的信息为：{information}")
@@ -485,7 +554,7 @@ class TwitterPlanner:
                 imitation_prompt = prediction_action(f'{predict_time}')
                 response = await general_generation([{"role":"system","content":imitation_prompt},{"role":"user","content":f'''{formatted_time}'''}])
                 self.log.info(f"预测的{predict_time}的活跃时间为：{response}")
-                response = eval(response)
+                response = self._parse_llm_dict_response(response, required_keys=["date", "detail"])
                 # action_time = {response["date"]:response["detail"]}
                 outputs.append(response)
         else:
@@ -497,7 +566,7 @@ class TwitterPlanner:
                 imitation_prompt = prediction_action(f'{predict_time}')
                 response = await general_generation([{"role":"system","content":GENERAL_PLAN},{"role":"user","content":f'''{predict_time}'''}])
                 self.log.info(f"预测的{predict_time}的活跃时间为：{response}")
-                response = eval(response)
+                response = self._parse_llm_dict_response(response, required_keys=["date", "detail"])
                 # 对response进行后处理，如果detail大于1，则随机选择一个时间，确保一天只活跃一个时间段
                 details = response["detail"]
                 if len(details) > 1:

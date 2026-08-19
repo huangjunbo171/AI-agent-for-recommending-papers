@@ -2,7 +2,15 @@ import logging
 import os
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
-from colorlog import ColoredFormatter, StreamHandler
+
+try:
+    from colorlog import ColoredFormatter, StreamHandler
+    HAS_COLORLOG = True
+except ModuleNotFoundError:
+    from logging import StreamHandler
+
+    ColoredFormatter = None
+    HAS_COLORLOG = False
 
 LOG_COLORS = {
     "DEBUG": "cyan",
@@ -51,7 +59,7 @@ class Logger:
         return handler
 
     def create_formatter(self, colored=False):
-        if colored:
+        if colored and HAS_COLORLOG:
             formatter = ColoredFormatter(
                 "%(log_color)s%(asctime)s - %(levelname)s - %(message)s",
                 datefmt=self.datefmt,

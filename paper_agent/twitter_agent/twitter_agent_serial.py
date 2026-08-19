@@ -8,13 +8,15 @@ try:
     from twitter_agent.twitter_bot import TwitterBot
     from twitter_agent.twitter_planner import TwitterPlanner
     from twitter_agent.cookie_login_patch import cookie_only_login_by_cookies
-    from paper_agent.paper_agent.paper_agent import PaperAgent
+    from paper_agent.paper_agent import PaperAgent
+    from paper_agent.prompts_test import paper_diary_post_system_prompt, paper_diary_post_user_prompt
     from paper_agent.scrap_objects import ScrapObjects
 except ModuleNotFoundError:
     from twitter_bot import TwitterBot
     from twitter_planner import TwitterPlanner
     from cookie_login_patch import cookie_only_login_by_cookies
     from paper_agent.paper_agent import PaperAgent
+    from paper_agent.prompts_test import paper_diary_post_system_prompt, paper_diary_post_user_prompt
     from paper_agent.scrap_objects import ScrapObjects
 from datetime import datetime,timedelta
 import json
@@ -24,8 +26,8 @@ import pdb
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from utils.utils import convert_time_us
-from utils.generation import generation_post,generation_comment,general_generation,describe_active_provider
-from utils.prompt import generate_paper_keywords_prompt
+from utils.generation import general_generation,general_generation_think,describe_active_provider
+from utils.prompt import generate_paper_keywords_prompt, comment_post_prompt
 import argparse
 
 TwitterBot.login_by_cookies = cookie_only_login_by_cookies
@@ -92,8 +94,290 @@ class TwitterAgent():
             self.log.info(f"读取账号{account_id}人设失败，使用默认人设：{e}")
             return default_character
 
-    def get_local_paper_candidates(self, paper_path=None):
-        return self.paper_agent.get_local_paper_candidates(paper_path=paper_path)
+    def get_local_paper_candidates(self, paper_path=None, domain=None):
+        return self.paper_agent.get_local_paper_candidates(paper_path=paper_path, domain=domain)
+
+    async def _sleep_for_phase(self, phase, min_seconds, max_seconds):
+        try:
+            sleep_scale = max(0.0, float(os.environ.get("TWITTER_SLEEP_SCALE", "1")))
+        except ValueError:
+            sleep_scale = 1.0
+            self.log.info("TWITTER_SLEEP_SCALE 格式无效，使用默认值 1")
+
+        duration = random.uniform(min_seconds, max_seconds) * sleep_scale
+        if duration <= 0:
+            return
+
+        self.log.info(f"{phase}，随机等待 {duration:.1f} 秒")
+        await asyncio.sleep(duration)
+
+    def _new_proactive_post_state(self):
+        trigger_threshold = random.randint(10, 15)
+        self.log.info(f"主动论文宣传发帖将在完成 {trigger_threshold} 次帖子互动后触发")
+        return {
+            "interaction_count": 0,
+            "trigger_threshold": trigger_threshold,
+            "attempted": False,
+            "posted": False,
+        }
+
+    async def _generate_comment_text(self, text, character, language='英文'):
+        fallback_text = {
+            '英文': "Interesting angle. I would like to see a bit more detail on the setup and trade-offs.",
+            '中文繁体': "這個角度很有意思，也想看看更多方法設定與取捨細節。",
+            '中文': "这个角度很有意思，也想看看更多方法设定与取舍细节。",
+        }.get(language, "Interesting angle. I would like to see a bit more detail on the setup and trade-offs.")
+        try:
+            _, content = await general_generation_think(
+                [
+                    {
+                        "role": "system",
+                        "content": comment_post_prompt(character=character, language=language),
+                    },
+                    {
+                        "role": "user",
+                        "content": text,
+                    },
+                ]
+            )
+        except Exception as e:
+            self.log.error(f"生成评论内容失败，改用兜底评论：{e}")
+            content = fallback_text
+        return str(content or fallback_text).strip()
+
+    async def _generate_post_text(self, text, character, language='英文', max_length=270):
+        fallback_text = {
+            '英文': "A thread worth tracking. One part that stands out to me is the concrete trade-off it surfaces.",
+            '中文繁体': "這個話題值得持續關注，最吸引我的是它把一個具體取捨講得很清楚。",
+            '中文': "这个话题值得持续关注，最吸引我的是它把一个具体取舍讲得很清楚。",
+        }.get(language, "A thread worth tracking. One part that stands out to me is the concrete trade-off it surfaces.")
+        system_prompt = f"""
+你是：{character}
+
+你正在为自己的 X/Twitter 账号写一条可以直接发布的帖子。
+
+要求：
+1) 基于我提供的话题或内容线索，写成一条自然、像真人发出的社交媒体帖子。
+2) 不要写成新闻摘要搬运，要有一点个人观察或判断。
+3) 不要包含 @、链接、#标签、emoji、Markdown。
+4) 输出语言为 {language}。
+5) 正文不超过 {max_length} 个字符。
+6) 只输出最终帖文，不要解释。
+""".strip()
+        try:
+            _, content = await general_generation_think(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ]
+            )
+        except Exception as e:
+            self.log.error(f"生成发帖内容失败，改用兜底帖子：{e}")
+            content = fallback_text
+        return str(content or fallback_text).strip()
+
+    async def _build_proactive_paper_post(self, character, domain=None, paper_path=None):
+        normalized_domain = domain or "Large Language Models for Recommendation"
+        paper_candidates = self.get_local_paper_candidates(paper_path=paper_path, domain=normalized_domain)
+        if not paper_candidates:
+            self.log.info(f"未找到可用于主动宣传的论文候选，domain={normalized_domain}")
+            return None
+
+        paper = random.choice(paper_candidates)
+        paper_info = await self.build_paper_info(paper=paper, domain=normalized_domain)
+        paper_title = paper_info.get("Title") or "Untitled paper"
+        paper_abstract = paper_info.get("Abstract") or ""
+        paper_url = paper_info.get("URL") or ""
+        _, content = await general_generation_think(
+            [
+                {
+                    "role": "system",
+                    "content": paper_diary_post_system_prompt(
+                        character=character,
+                        max_length=270,
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": paper_diary_post_user_prompt(
+                        paper_title=paper_title,
+                        paper_abstract=paper_abstract,
+                    ),
+                },
+            ]
+        )
+        self.log.info(f"主动宣传论文生成的原始内容是：{content}")
+
+        if not content:
+            content = f"Today's paper diary: {paper_title} gave me one useful idea to keep testing."
+            if paper_abstract:
+                content += " The setup is simple, but the trade-off is worth revisiting."
+
+        content = "".join(ch for ch in str(content) if ord(ch) <= 0xFFFF).strip()
+        reference_text = self.paper_agent._paper_reference_text(paper_url)
+        suffix_parts = []
+        if reference_text and reference_text.lower() not in content.lower():
+            suffix_parts.append(reference_text)
+        if paper_url and paper_url not in content:
+            suffix_parts.append(paper_url)
+        suffix = " ".join(suffix_parts).strip()
+
+        if suffix:
+            max_body_length = max(1, 270 - len(suffix) - 1)
+            content = self.paper_agent.cut_content(content, max_length=max_body_length)
+            content = f"{content} {suffix}".strip()
+        else:
+            content = self.paper_agent.cut_content(content, max_length=270)
+
+        if not content:
+            self.log.info(f"主动宣传论文 {paper_title} 的发帖内容为空，跳过")
+            return None
+
+        return {
+            "paper_info": paper_info,
+            "content": content,
+            "file_paths": paper_info.get("image_paths") or [],
+        }
+
+    async def _publish_proactive_paper_post(self, bot, account_id, character, domain=None, paper_path=None):
+        post_payload = await self._build_proactive_paper_post(
+            character=character,
+            domain=domain,
+            paper_path=paper_path,
+        )
+        if not post_payload:
+            return False
+
+        self.log.info(f"账号{account_id}达到主动发帖条件，开始宣传论文：{post_payload['paper_info'].get('Title')}")
+        await self._sleep_for_phase("发布论文阅读日记前", 10, 25)
+        await bot.posts(
+            account_id=int(account_id),
+            content=post_payload["content"],
+            file_paths=post_payload["file_paths"],
+        )
+        await self._sleep_for_phase("论文阅读日记发布完成", 20, 45)
+        return True
+
+    async def _register_interaction_and_maybe_post(self, bot, account_id, character, proactive_post_state, interaction_name, domain=None, paper_path=None):
+        if not proactive_post_state:
+            return False
+
+        proactive_post_state["interaction_count"] += 1
+        current_count = proactive_post_state["interaction_count"]
+        trigger_threshold = proactive_post_state["trigger_threshold"]
+        self.log.info(
+            f"账号{account_id}完成第 {current_count} 次帖子互动（{interaction_name}），"
+            f"主动发帖阈值为 {trigger_threshold}"
+        )
+
+        if proactive_post_state["attempted"] or current_count < trigger_threshold:
+            return False
+
+        proactive_post_state["attempted"] = True
+        proactive_post_state["posted"] = await self._publish_proactive_paper_post(
+            bot=bot,
+            account_id=account_id,
+            character=character,
+            domain=domain,
+            paper_path=paper_path,
+        )
+        return proactive_post_state["posted"]
+
+    async def _interact_with_target_posts(
+        self,
+        bot,
+        account_id,
+        character,
+        model,
+        target_informations,
+        proactive_post_state,
+        domain=None,
+        paper_path=None,
+        allow_transmit=True,
+    ):
+        if not target_informations:
+            self.log.info(f'账号{account_id}没有可互动的关注列表大V帖子，继续后续相关帖子互动')
+            return
+
+        comment_published = False
+        like_published = False
+        transmit_published = not allow_transmit
+
+        for published in target_informations:
+            actions = [
+                action
+                for flag, action in zip(
+                    [like_published, comment_published, transmit_published],
+                    ["点赞", "评论", "转发"],
+                )
+                if not flag
+            ]
+            self.log.info(f'账号{account_id}优先对关注列表大V帖子执行的操作是：{actions}')
+            if not actions:
+                break
+            if 'content' not in published:
+                continue
+
+            text = published["content"]
+            if published["note_url"] == 'Unknown':
+                continue
+
+            published_break = False
+            for action in actions:
+                sql = f"""SELECT * FROM twitter_interaction WHERE Account_id ={int(account_id)} AND URL = '{published["note_url"]}' AND Action = '{action}';"""
+                select_result = self.database.get_dict_data_sql(sql)
+                if select_result:
+                    self.log.info(f'账号{account_id}已经对帖子{published["note_url"]}执行过{action}操作')
+                    published_break = True
+                    break
+
+                if action == '点赞':
+                    await bot.likes(account_id=int(account_id), url=published["note_url"])
+                    like_published = True
+                elif action == '评论':
+                    content = await self._generate_comment_text(
+                        text=text,
+                        character=character,
+                        language='英文',
+                    )
+                    self.log.info(f'模型生成的大V帖子评论内容是：{content}')
+                    content = self.cut_content(content).replace('#', '  ')
+                    self.log.info(f'字数检查后的大V帖子评论内容是：{content}')
+                    if content == '':
+                        published_break = True
+                        break
+                    await bot.comments(account_id=int(account_id), url=published["note_url"], content=content)
+                    comment_published = True
+                elif action == '转发':
+                    content = await self._generate_comment_text(
+                        text=text,
+                        character=character,
+                        language='英文',
+                    )
+                    self.log.info(f'模型生成的大V帖子转发内容是：{content}')
+                    content = self.cut_content(content).replace('#', '  ')
+                    self.log.info(f'字数检查后的大V帖子转发内容是：{content}')
+                    if content == '':
+                        published_break = True
+                        break
+                    await bot.transmits(account_id=int(account_id), url=published["note_url"], content=content)
+                    transmit_published = True
+
+                await self._register_interaction_and_maybe_post(
+                    bot=bot,
+                    account_id=int(account_id),
+                    character=character,
+                    proactive_post_state=proactive_post_state,
+                    interaction_name=action,
+                    domain=domain,
+                    paper_path=paper_path,
+                )
+                published_break = True
+                break
+
+            time.sleep(random.uniform(10,18))
+            if published_break:
+                continue
 
     @staticmethod
     def _run_worker_sync(worker, kwargs):
@@ -219,14 +503,6 @@ class TwitterAgent():
                 os.environ["FORCE_RUN_NOW"] = "1"
                 if max_cycles is None:
                     max_cycles = 1
-            await self.paper_agent.auto_cultivation(
-                account_ids=[int(account_id) for account_id in account_ids],
-                domain=domain,
-                paper_path=paper_path,
-                max_cycles=max_cycles,
-                max_runtime_minutes=max_runtime_minutes,
-            )
-            return
         if should_force_run and max_cycles is None:
             max_cycles = 1
         start_ts = time.monotonic()
@@ -301,7 +577,9 @@ class TwitterAgent():
                         # news_information, other_information = await planner.get_interested_information(account_id=int(account_ids[0]),news=news,followings=followings,url=url,characters=character)
                         # self.log.info(f'''对于账户{account_dict}获取到的感兴趣的新闻内容为：{news_information}''')
                         # self.log.info(f'''对于账户{account_dict}获取到的感兴趣的其他内容为：{other_information}''')
+                        await self._sleep_for_phase("开始搜索新闻和相关帖子前", 8, 18)
                         all_inforamtion = await planner.get_all_informations(account_id=int(account_ids[0]),news=news,followings=followings,url=url)
+                        await self._sleep_for_phase("新闻和相关帖子搜索完成", 5, 12)
                         self.log.info(f'''对于账户{account_dict}获取到的信息是：{all_inforamtion}''')
                     
                     for time_key,ids in account_dict.items():
@@ -320,14 +598,19 @@ class TwitterAgent():
                                     character = await self.get_account_character(account_id=int(account))
                                     topic_information = random.sample(topics_informations,1)  # 随机选一个话题
                                     self.log.info(f'''对于账户{account}获取到的话题为：{topic_information[0]}''')
-                                    content,response_time = await generation_post(text=topic_information[0],model=model,output_len=1000,character=character,language='中文繁体')
+                                    content = await self._generate_post_text(
+                                        text=topic_information[0],
+                                        character=character,
+                                        language='中文繁体',
+                                    )
                                     content =  self.cut_content(content)
                                     self.log.info(f'要发布的内容是：{content}')
                                     bot = TwitterBot(log_path=f"./logs/twitter/{account}/twitter_log.log")  
+                                    await self._sleep_for_phase(f"账号{account}发布话题帖子前", 10, 25)
                                     await bot.posts(account_id=int(account),content=content)
+                                    await self._sleep_for_phase(f"账号{account}话题帖子发布完成", 20, 45)
                                     bot.scroll(duration=random.uniform(20,40))
                                     bot.driver.quit()
-                                    time.sleep(random.uniform(60,300))
                                 time.sleep(1000)
                                 xingyun_flag = True
                                 break # 星云大师发完贴以后，结束掉循环
@@ -354,26 +637,53 @@ class TwitterAgent():
                                 time.sleep(random.uniform(30,60))
                                 # 更新账号的user profile
                                 await bot.get_user_profile(account_id=int(account))
+                                proactive_post_state = self._new_proactive_post_state()
+                                if paper_mode:
+                                    self.log.info(f'账号{account}先发布论文阅读日记，再执行互动')
+                                    proactive_post_state["attempted"] = True
+                                    proactive_post_state["posted"] = await self._publish_proactive_paper_post(
+                                        bot=bot,
+                                        account_id=int(account),
+                                        character=character,
+                                        domain=domain,
+                                        paper_path=paper_path,
+                                    )
                                 bot.scroll(duration=random.uniform(10,20))
                                 self.log.info(f'获取账号{account}关注的目标人物的五天之内的帖子')
                                 try:
+                                    await self._sleep_for_phase(f"账号{account}搜索关注列表大V帖子前", 8, 18)
                                     target_informations = await planner.get_target_information(account_id=int(account),bot=bot)
+                                    await self._sleep_for_phase(f"账号{account}关注列表大V帖子搜索完成", 5, 12)
                                     self.log.info(f'''对于账户{account}获取到的目标人物近五天的帖子信息是：{target_informations}''') 
                                     bot.scroll(duration=random.uniform(10,18))
                                 except Exception as e:
                                     self.log.error(f'获取账号{account}关注的目标人物的帖子失败，错误信息：{e}')
                                     target_informations = []
+                                await self._interact_with_target_posts(
+                                    bot=bot,
+                                    account_id=int(account),
+                                    character=character,
+                                    model=model,
+                                    target_informations=target_informations,
+                                    proactive_post_state=proactive_post_state,
+                                    domain=domain,
+                                    paper_path=paper_path,
+                                    allow_transmit=True,
+                                )
                                 # 定义两个标志位，用来判断是否发帖成功/转发成功
                                 news_published = False
                                 other_published = False
-
                                 if len(news_information) != 0:
                                     # 发布新闻
                                     for published in news_information:
                                         action = "发帖"
                                         text = published["news"]  # 新闻话题
                                         # 发一个帖子
-                                        content,response_time = await generation_post(text=text,model=model,output_len=1000,character=character,language='英文',style='informal')
+                                        content = await self._generate_post_text(
+                                            text=text,
+                                            character=character,
+                                            language='英文',
+                                        )
                                         self.log.info(f'模型生成的发布内容是：{content}')
                                         # self.log.info(f'模型响应时间是：{response_time:.2f} 秒')
                                         content =  self.cut_content(content).replace('#','  ')
@@ -382,7 +692,9 @@ class TwitterAgent():
                                             self.log.info(f'要发布的内容为空，选择下一个新闻内容进行发布')
                                             news_published = False
                                             continue
+                                        await self._sleep_for_phase(f"账号{account}发布新闻帖子前", 10, 25)
                                         await bot.posts(account_id=int(account),content=content)
+                                        await self._sleep_for_phase(f"账号{account}新闻帖子发布完成", 20, 45)
                                         news_published = True # 表示发布成功
                                         break
                                 bot.scroll(duration=random.uniform(10,18))
@@ -398,7 +710,11 @@ class TwitterAgent():
                                         if select_result:
                                             continue
                                         if action == '转发':
-                                            content,response_time = await generation_comment(text=text,model=model,output_len=200,character=character,language='英文',style='informal')
+                                            content = await self._generate_comment_text(
+                                                text=text,
+                                                character=character,
+                                                language='英文',
+                                            )
                                             self.log.info(f'模型生成的转发内容是：{content}')
                                             # self.log.info(f'模型响应时间是：{response_time:.2f} 秒')
                                             content =  self.cut_content(content).replace('#','  ')
@@ -410,11 +726,24 @@ class TwitterAgent():
                                             content = None
                                         await bot.transmits(account_id=int(account),url=published["note_url"],content=content)
                                         other_published = True  # 表示操作成功
+                                        await self._register_interaction_and_maybe_post(
+                                            bot=bot,
+                                            account_id=int(account),
+                                            character=character,
+                                            proactive_post_state=proactive_post_state,
+                                            interaction_name=action,
+                                            domain=domain,
+                                            paper_path=paper_path,
+                                        )
                                         break
                                 # time.sleep(10)
                                 bot.scroll(duration=random.uniform(10,20))  # 在页面随机滑动几秒
 
                                 # 定义标志位，表示 是否评论/点赞成功
+                                bot.scroll(duration=random.uniform(10,20))
+                                bot.scroll(duration=random.uniform(7,20))
+                                bot.driver.driver.quit()
+                                continue
                                 comment_published = False
                                 like_published = False
                                 published_break  = False
@@ -451,10 +780,23 @@ class TwitterAgent():
                                         if action == '点赞':
                                             await bot.likes(account_id=int(account),url = published["note_url"])
                                             like_published = True # 表示点赞成功
+                                            await self._register_interaction_and_maybe_post(
+                                                bot=bot,
+                                                account_id=int(account),
+                                                character=character,
+                                                proactive_post_state=proactive_post_state,
+                                                interaction_name=action,
+                                                domain=domain,
+                                                paper_path=paper_path,
+                                            )
                                             published_break = True
                                             break 
                                         elif action == '评论':
-                                            content,response_time = await generation_comment(text=text,model=model,output_len=200,character=character,language='英文',style='informal')
+                                            content = await self._generate_comment_text(
+                                                text=text,
+                                                character=character,
+                                                language='英文',
+                                            )
                                             self.log.info(f'模型生成的评论内容是：{content}')
                                             content =  self.cut_content(content).replace('#','  ')
                                             self.log.info(f'经过字数检查之后要评论的内容是：{content}')
@@ -465,10 +807,23 @@ class TwitterAgent():
                                                 break
                                             await bot.comments(account_id=int(account),url=published["note_url"],content=content)
                                             comment_published = True # 表示评论成功
+                                            await self._register_interaction_and_maybe_post(
+                                                bot=bot,
+                                                account_id=int(account),
+                                                character=character,
+                                                proactive_post_state=proactive_post_state,
+                                                interaction_name=action,
+                                                domain=domain,
+                                                paper_path=paper_path,
+                                            )
                                             published_break = True
                                             break 
                                         elif action == '转发':
-                                            content,response_time = await generation_comment(text=text,model=model,output_len=200,character=character,language='英文',style='informal')
+                                            content = await self._generate_comment_text(
+                                                text=text,
+                                                character=character,
+                                                language='英文',
+                                            )
                                             self.log.info(f'模型生成的转发内容是：{content}')
                                             content =  self.cut_content(content).replace('#','  ')
                                             self.log.info(f'经过字数检查之后要转发的内容是：{content}')
@@ -479,6 +834,15 @@ class TwitterAgent():
                                                 break
                                             await bot.transmits(account_id=int(account),url=published["note_url"],content=content)
                                             transmit_published = True # 表示转发成功
+                                            await self._register_interaction_and_maybe_post(
+                                                bot=bot,
+                                                account_id=int(account),
+                                                character=character,
+                                                proactive_post_state=proactive_post_state,
+                                                interaction_name=action,
+                                                domain=domain,
+                                                paper_path=paper_path,
+                                            )
                                             published_break = True
                                             break
                                     time.sleep(random.uniform(10,18))

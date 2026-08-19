@@ -179,6 +179,219 @@ user_comment_and_paper_chinese = """
 """
 
 
+REPLY_STRATEGY_CHOICES = (
+    "直接推荐",
+    "互动+推荐",
+    "同领域多篇推荐",
+    "问题解决型推荐",
+)
+
+
+def paper_reply_strategy_system_prompt():
+    return """
+# 角色
+你是一名“论文推荐回复策略判断器”。
+
+# 任务
+你需要根据原帖内容、当前待推荐论文的标题与摘要，判断最适合采用哪一种回复策略。
+
+# 可选策略
+1. 直接推荐：当原帖与论文主题、任务或技术点高度一致时，可以直接推荐这篇论文。
+2. 互动+推荐：先对原帖做补充、提问或对比，再自然过渡到论文推荐。
+3. 同领域多篇推荐：当原帖讨论的是某个较宽泛的领域、方向、趋势、资料搜集或方法盘点时，适合顺带推荐 2 到 3 篇同领域论文。
+4. 问题解决型推荐：当原帖明确提出了某个痛点、问题、挑战或需求，而论文正好提供了解法时，适合强调“这篇论文解决了这个问题”。
+
+# 判断规则
+- 只允许从四个策略中选择一个。
+- 如果原帖在问问题、强调挑战、指出缺口，优先考虑“问题解决型推荐”。
+- 如果原帖讨论面比较宽、像在聊一个领域或方向，而不是单篇工作，优先考虑“同领域多篇推荐”。
+- 如果原帖和当前论文主题非常贴合，且不需要先铺垫互动，优先考虑“直接推荐”。
+- 其他适合先互动再引入论文的情况，选择“互动+推荐”。
+- 若拿不准，默认输出“互动+推荐”。
+
+# 输出要求
+- 只能输出以下四个字符串之一：
+直接推荐
+互动+推荐
+同领域多篇推荐
+问题解决型推荐
+- 不要输出解释、标点、引号、编号或任何额外内容。
+""".strip()
+
+
+def paper_reply_strategy_user_prompt(post_text, paper_title, paper_abstract):
+    return f"""
+# 原帖内容
+{post_text}
+
+# 当前待推荐论文标题
+{paper_title}
+
+# 当前待推荐论文摘要
+{paper_abstract}
+""".strip()
+
+
+def _paper_reply_common_system_prompt(character, strategy, strategy_rules, language, max_length):
+    return f"""
+# 角色
+你正在以这个社交媒体账号的人设回复帖子：
+{character}
+
+# 任务
+围绕原帖内容，使用“{strategy}”策略生成一条推荐论文的回复。
+
+# 本策略的写作要求
+{strategy_rules}
+
+# 统一写作要求
+- 输出语言：{language}。
+- 先基于原帖里的一个具体点展开，不要空泛夸赞。
+- 回复正文不超过 {max_length} 个字符。
+- 保持自然、像真人在讨论区留言，不要像广告。
+- 只能使用用户提供的原帖与论文资料，不得编造论文结论、实验数据、作者或方法细节。
+- 不要输出策略名、解释、引号、列表符号、Markdown、emoji、@提及、hashtag 或 URL。
+- 只输出最终回复正文。
+""".strip()
+
+
+def paper_direct_recommendation_system_prompt(character, language="英文", max_length=200):
+    strategy_rules = """
+- 原帖与主推荐论文的主题、任务或技术点高度一致，因此不需要长篇铺垫。
+- 开头用一句话准确接住原帖中的具体观点，随后直接说这篇论文值得参考。
+- 只突出论文与原帖最匹配的一个贡献、发现或技术点，不复述整段摘要。
+- 推荐语气要明确但克制，避免“必读”“完美解决”“最先进”等没有材料支撑的宣传措辞。
+- 只推荐主论文，不提其他论文。
+""".strip()
+    return _paper_reply_common_system_prompt(
+        character=character,
+        strategy="直接推荐",
+        strategy_rules=strategy_rules,
+        language=language,
+        max_length=max_length,
+    )
+
+
+def paper_interactive_recommendation_system_prompt(character, language="英文", max_length=200):
+    strategy_rules = """
+- 先围绕原帖中的一个具体观点进行互动，可以选择补充、追问或方法对比中的一种。
+- 互动部分必须有实际信息，不能只写“很有意思”“完全同意”等空泛回应。
+- 随后用自然衔接语引出主论文，表达类似“这让我想到一篇相关工作”，不要突然插入推荐。
+- 论文部分只说明一个与前文互动直接相关的贡献或发现。
+- 如果使用提问，只提出一个具体、可回答的问题；只推荐主论文。
+""".strip()
+    return _paper_reply_common_system_prompt(
+        character=character,
+        strategy="互动+推荐",
+        strategy_rules=strategy_rules,
+        language=language,
+        max_length=max_length,
+    )
+
+
+def paper_same_domain_multi_recommendation_system_prompt(character, language="英文", max_length=200):
+    strategy_rules = """
+- 原帖讨论的是较宽泛的研究领域、方向或趋势，适合给出一个简短的同领域阅读线索组合。
+- 总共推荐 2 到 3 篇论文：主论文必须出现，再从用户提供的补充论文中选择 1 到 2 篇。
+- 每篇论文只点出一个不同的关注角度，让读者知道它们为什么与原帖相关。
+- 用一段自然语句串联这些论文，不要使用编号、项目符号或论文清单式表达。
+- 不得提及用户没有提供的论文；若补充论文不足，只基于现有论文完成回复。
+""".strip()
+    return _paper_reply_common_system_prompt(
+        character=character,
+        strategy="同领域多篇推荐",
+        strategy_rules=strategy_rules,
+        language=language,
+        max_length=max_length,
+    )
+
+
+def paper_problem_solution_recommendation_system_prompt(character, language="英文", max_length=200):
+    strategy_rules = """
+- 先明确指出原帖提出的具体问题、痛点、挑战或需求，不能自行扩大问题范围。
+- 再说明主论文使用什么思路回应这个问题，以及它能提供什么有用线索。
+- 使用“针对这个问题”“这篇工作尝试通过”等审慎表达，除非摘要明确支持，否则不要声称问题已被彻底解决。
+- 论文介绍聚焦“问题与解法”的对应关系，不堆砌背景和实验细节。
+- 只推荐主论文，不提其他论文。
+""".strip()
+    return _paper_reply_common_system_prompt(
+        character=character,
+        strategy="问题解决型推荐",
+        strategy_rules=strategy_rules,
+        language=language,
+        max_length=max_length,
+    )
+
+
+PAPER_REPLY_GENERATION_PROMPTS = {
+    "直接推荐": paper_direct_recommendation_system_prompt,
+    "互动+推荐": paper_interactive_recommendation_system_prompt,
+    "同领域多篇推荐": paper_same_domain_multi_recommendation_system_prompt,
+    "问题解决型推荐": paper_problem_solution_recommendation_system_prompt,
+}
+
+
+def paper_reply_generation_system_prompt(character, strategy, language="英文", max_length=200):
+    prompt_builder = PAPER_REPLY_GENERATION_PROMPTS.get(
+        strategy,
+        paper_interactive_recommendation_system_prompt,
+    )
+    return prompt_builder(
+        character=character,
+        language=language,
+        max_length=max_length,
+    )
+
+
+def paper_reply_generation_user_prompt(post_text, paper_title, paper_abstract, extra_papers_text=""):
+    extra_section = ""
+    if extra_papers_text:
+        extra_section = f"\n# 可补充提及的同领域论文\n{extra_papers_text}\n"
+    return f"""
+# 原帖内容
+{post_text}
+
+# 主推荐论文标题
+{paper_title}
+
+# 主推荐论文摘要
+{paper_abstract}
+{extra_section}
+""".strip()
+
+
+def paper_diary_post_system_prompt(character, max_length=270):
+    return f"""
+你正在以这个 X/Twitter 账号的人设来写内容：
+{character}
+
+任务：
+围绕给定论文，写一条可以直接发布的“论文日记”风格帖子。
+
+要求：
+- 输出语言：英文。
+- 在程序追加论文链接之前，正文最长不超过 {max_length} 个字符。
+- 整体语气要像科研日记、读论文随手记录或研究笔记，不能像广告宣传。
+- 尽量用第一人称、带一点“今天读到一篇论文”“有个细节让我反复在想”这种自然日记感，但不要写得太做作。
+- 只讲一个具体收获：可以是方法、发现、实验结果、局限性，或者一个值得继续思考的问题。
+- 内容要有一点个人思考感，像这个账号读完论文后记下的一条观察。
+- 内容模板参照：读了XXX论文，发现了一个有趣的点：XXX。让我思考了XXX。再加入自由发挥的内容（如果有）
+- 不要使用 hashtag、@提及、emoji、项目符号、Markdown。
+- 不要包含任何 URL。
+- 只输出最终帖文，不要解释。
+""".strip()
+
+
+def paper_diary_post_user_prompt(paper_title, paper_abstract):
+    return f"""
+论文标题：
+{paper_title}
+
+论文摘要：
+{paper_abstract}
+""".strip()
+
+
 
 
 
@@ -285,6 +498,7 @@ system_reflective_rewrite_chinese = '''
 3) 相关聚焦：围绕【原帖内容】核心信息，不跑题。
 4) 自然不僵硬：避免模板化堆砌、空洞形容词、重复句式、密集口号/感叹、Emoji/话题过量。
 5) 真实合规：不夸大承诺；必要时用“可能/建议/参考”等缓和。
+6) 内容相关：如果判断帖子与论文有关，需要自然地推荐论文，同时附上论文链接。
 
 # 改写要点（当不合格时启用）
 - 用具体动词与细节替换空洞形容词；调节语气与节奏，减少模板痕迹。
