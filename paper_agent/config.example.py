@@ -57,6 +57,9 @@ DATABASE_INFO = {
     "PASSWORD": os.environ.get("DB_PASSWORD", ""),
 }
 
+# LanceDB 必须使用 papers 根目录下的子库，部署时可指向服务器挂载目录。
+LANCEDB_PAPERS_PATH = os.environ.get("LANCEDB_PAPERS_PATH", "./papers/lancedb")
+
 DETAYUN_INFO = {
     "USERNAME": os.environ.get("DETAYUN_USERNAME", ""),
     "PASSWORD": os.environ.get("DETAYUN_PASSWORD", ""),

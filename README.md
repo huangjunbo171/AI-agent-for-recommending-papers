@@ -2,6 +2,61 @@
 
 本项目面向论文推荐场景构建社交媒体智能体。系统可以从论文库或本地论文压缩包中提取论文信息，根据账号人设筛选相关帖子，并在 X/Twitter 上完成论文阅读日记发布、关注列表互动和相关帖子推荐回复。
 
+## arXiv 论文基础入库链路
+
+`paper_agent/paper_agent/arxiv_ingest.py` 会按提交时间抓取 arXiv 指定分类的最新论文，调用 DeepSeek 从摘要中生成结构化分析，将结果写入 MySQL 的 `papers_info`、`papers_source`、`papers_analysis`，并用 BGE-M3 生成 1024 维向量后同步到 LanceDB `paper_sections`。
+
+连接信息和密钥只通过环境变量或未纳入 Git 的 `.env` 提供：
+
+```dotenv
+DEEPSEEK_API_KEY=<your-key>
+DB_HOST=<mysql-host>
+DB_PORT=3306
+DB_USER=<mysql-user>
+DB_PASSWORD=<mysql-password>
+LANCEDB_PAPERS_PATH=./papers/lancedb
+```
+
+安装独立依赖并先执行不落库验证：
+
+```powershell
+python -m pip install -r paper_agent\requirements-ingest.txt
+python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --limit 10 --provider deepseek --embedding-model BAAI/bge-m3 --dry-run
+```
+
+确认输出正常后，移除 `--dry-run` 即可正式入库。重复执行会按稳定的 `paper_id` 更新记录，不会重复插入。如果 MySQL 已完成、仅需修复本地向量库，可使用：
+
+```powershell
+python paper_agent\paper_agent\arxiv_ingest.py --limit 10 --embedding-model BAAI/bge-m3 --sync-lancedb-only
+```
+
+MySQL 是权威数据源。程序结束前会校验本次论文在三张 MySQL 表和 LanceDB 中的 ID 是否一致；任一环节不足指定数量或向量维度不是 1024 时返回失败。
+
+## LanceDB 论文分段库接口
+
+项目提供 `paper_agent/utils/lancedb_store.py` 数据访问层，用于管理 `papers` 目录下的 LanceDB 子库。除连接、健康检查和 Schema 校验外，它还支持安全升级空表、按 `paper_id` 幂等写入论文向量，以及读取已有论文 ID 用于跨库校验。
+
+先安装可选依赖，并将环境变量指向服务器上 `papers` 文件目录的本地挂载点：
+
+```powershell
+pip install lancedb pyarrow
+$env:LANCEDB_PAPERS_PATH = ".\papers\lancedb"
+python paper_agent\scripts\init_lancedb.py
+```
+
+```python
+from utils.lancedb_store import LanceDBPaperStore
+
+store = LanceDBPaperStore(database_name="vector_store")
+print(store.health_check())
+store.ensure_schema()  # 仅在旧表为空时允许升级 Schema
+print(store.validate_schema())
+```
+
+标准表保留论文元数据、`section_text` 和 `embedding_text`，并使用 `embedding_model` 记录模型名称、`vector` 保存 1024 维 BGE-M3 向量。子库名不允许包含绝对路径、目录分隔符或 `..`，以确保接口不能访问 `papers` 根目录之外的位置。
+
+默认 `.env` 已设置为 `./papers/lancedb`。远端 MySQL `papers` 数据库仍是论文主数据源，入库命令通过 `paper_id` 将摘要级文本和向量同步到本机 LanceDB；未来可在保持同一关联键的前提下扩展为 PDF 全文分段。
+
 ## 2026.8.19：从被动回复到主动论文运营
 
 早期流程主要依赖“看到帖子后立即生成一条回复”。这种方式虽然能够完成互动，却容易出现两个问题：一是回复停留在一般性讨论，没有真正把论文推荐给读者；二是所有帖子使用相近的推荐句式，论文与原帖之间的关系表达得不够准确。

@@ -10,6 +10,7 @@ paper_agent/logs/
 paper_agent/information/
 QRcode/
 papers/extracted/
+papers/lancedb/
 
 # Python cache/build artifacts
 __pycache__/

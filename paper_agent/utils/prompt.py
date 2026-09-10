@@ -909,3 +909,26 @@ def jiankong_comment_post_prompt(character=None, language:str='英文'):
     '''
 
     return prompt
+
+
+def analyze_paper_metadata_prompt():
+    """Prompt for conservative, machine-readable abstract analysis."""
+    return '''
+You are a scientific-paper metadata analyst. Analyze only the title, abstract,
+authors, and arXiv categories supplied by the user. Do not use outside facts and
+do not infer claims that are not supported by the abstract.
+
+Return exactly one valid JSON object with these keys:
+{
+  "keywords": ["exactly five English academic keywords"],
+  "research_topics": ["three to five concise research topics"],
+  "core_method": "the central method, or an empty string if not stated",
+  "datasets": ["datasets explicitly named in the abstract"],
+  "main_contributions": ["contributions explicitly supported by the abstract"],
+  "main_results": ["results explicitly supported by the abstract"],
+  "limitations": ["limitations explicitly stated in the abstract"]
+}
+
+All array items must be strings. Use an empty array when information is absent.
+Do not add Markdown fences, commentary, citations, or additional keys.
+'''.strip()
