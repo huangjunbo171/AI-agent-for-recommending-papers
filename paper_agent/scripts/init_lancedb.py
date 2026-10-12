@@ -22,6 +22,7 @@ def load_dotenv(path: Path) -> None:
 
 
 def main() -> int:
+    """加载本地配置，初始化 LanceDB 子库并返回执行状态码。"""
     load_dotenv(PROJECT_ROOT / ".env")
     from utils.lancedb_store import LanceDBPaperStore
 

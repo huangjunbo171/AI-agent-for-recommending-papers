@@ -4,12 +4,22 @@
 
 ## arXiv 论文基础入库链路
 
-`paper_agent/paper_agent/arxiv_ingest.py` 会按提交时间抓取 arXiv 指定分类的最新论文，调用 DeepSeek 从摘要中生成结构化分析，将结果写入 MySQL 的 `papers_info`、`papers_source`、`papers_analysis`，并用 BGE-M3 生成 1024 维向量后同步到 LanceDB `paper_sections`。
+`paper_agent/paper_agent/arxiv_ingest.py` 会按提交时间抓取 arXiv 指定分类的最新英文论文，下载 PDF 后由 MinerU 生成 `full.md`，并从中确定标题和摘要。DeepSeek 以完整的 `full.md` 正文为主要依据生成英文结构化分析，标题、作者、分类和摘要只作为辅助元数据；程序不会退回到仅根据摘要分析。`core_method` 会生成 300～600 个英文词的详细方法说明，覆盖方法流程、关键模块、训练或推理过程、目标函数和核心创新，但不会补写正文没有的信息。
+
+程序还会依据正文保守判断代码开放状态：明确开放为 `yes/1`，明确未开放或声明未来发布为 `no/0`，正文没有可靠说明时为 `unknown/NULL`。只有正文明确关联到本文代码的 GitHub 仓库才会写入 `code_url`，参考文献中的第三方链接不会被采用。`papers_source.source` 固定表示抓取来源 `arxiv`；`papers_info.venue` 只保存 `journal_ref` 或正文明确说明已经接收、发表的会议或期刊，`arXiv`、投稿中和审稿中均不算 venue。引用量字段目前不由这条链路更新。
+
+主数据写入 MySQL `papers` 数据库的三张论文表，标题和摘要通过 DashScope `text-embedding-v4` 生成 1024 维向量，并同步到新 LanceDB 表 `paper_embeddings`。旧表 `paper_sections` 不会被覆盖或删除。
+
+全文默认最多允许 240000 个字符，可通过 `PAPER_ANALYSIS_MAX_CHARS` 调整。超过上限时该论文会明确失败并跳过，不会静默截断，也不会改用摘要分析。
 
 连接信息和密钥只通过环境变量或未纳入 Git 的 `.env` 提供：
 
 ```dotenv
 DEEPSEEK_API_KEY=<your-key>
+MINERU_TOKEN=<your-mineru-token>
+MINERU_BASE_URL=https://mineru.net/api/v4
+DASHSCOPE_API_KEY=<your-dashscope-key>
+DASHSCOPE_EMBEDDING_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
 DB_HOST=<mysql-host>
 DB_PORT=3306
 DB_USER=<mysql-user>
@@ -21,18 +31,34 @@ LANCEDB_PAPERS_PATH=./papers/lancedb
 
 ```powershell
 python -m pip install -r paper_agent\requirements-ingest.txt
-python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --limit 10 --provider deepseek --embedding-model BAAI/bge-m3 --dry-run
+python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --limit 1 --provider deepseek --embedding-provider dashscope --embedding-model text-embedding-v4 --mineru-model vlm --dry-run
 ```
 
-确认输出正常后，移除 `--dry-run` 即可正式入库。重复执行会按稳定的 `paper_id` 更新记录，不会重复插入。如果 MySQL 已完成、仅需修复本地向量库，可使用：
+确认单篇输出正常后，使用 10 篇参数正式入库。重复执行会按稳定的 `paper_id` 更新记录，不会重复插入：
 
 ```powershell
-python paper_agent\paper_agent\arxiv_ingest.py --limit 10 --embedding-model BAAI/bge-m3 --sync-lancedb-only
+python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --limit 10 --provider deepseek --embedding-provider dashscope --embedding-model text-embedding-v4 --mineru-model vlm
 ```
+
+如果 MySQL 已完成、仅需修复本地向量库，可使用：
+
+```powershell
+python paper_agent\paper_agent\arxiv_ingest.py --limit 10 --embedding-provider dashscope --embedding-model text-embedding-v4 --sync-lancedb-only
+```
+
+如果需要根据 MinerU 缓存的全文重新分析 MySQL 中已有论文，可使用：
+
+```powershell
+python paper_agent\paper_agent\arxiv_ingest.py --limit 10 --provider deepseek --reanalyze-existing
+```
+
+该模式会在单个事务中更新英文关键词、详细分析、venue 和代码开放字段；不会修改论文标题、作者、摘要、引用量、`papers_source` 或 LanceDB。若全文缓存缺失、论文不是英文或本批数量不足，整批不会写入。
 
 MySQL 是权威数据源。程序结束前会校验本次论文在三张 MySQL 表和 LanceDB 中的 ID 是否一致；任一环节不足指定数量或向量维度不是 1024 时返回失败。
 
-## LanceDB 论文分段库接口
+如果需要显式使用 D 盘缓存的本地 BGE-M3，可传入 `--embedding-provider bge --embedding-model BAAI/bge-m3`，并通过 `EMBEDDING_MODEL_PATH` 指向已有模型。
+
+## LanceDB 精简论文向量库接口
 
 项目提供 `paper_agent/utils/lancedb_store.py` 数据访问层，用于管理 `papers` 目录下的 LanceDB 子库。除连接、健康检查和 Schema 校验外，它还支持安全升级空表、按 `paper_id` 幂等写入论文向量，以及读取已有论文 ID 用于跨库校验。
 
@@ -53,9 +79,9 @@ store.ensure_schema()  # 仅在旧表为空时允许升级 Schema
 print(store.validate_schema())
 ```
 
-标准表保留论文元数据、`section_text` 和 `embedding_text`，并使用 `embedding_model` 记录模型名称、`vector` 保存 1024 维 BGE-M3 向量。子库名不允许包含绝对路径、目录分隔符或 `..`，以确保接口不能访问 `papers` 根目录之外的位置。
+标准表 `paper_embeddings` 只包含 `paper_id`、`title`、`abstract`、`embedding_text`、`embedding_model` 和 1024 维 `vector` 六个非空字段。子库名不允许包含绝对路径、目录分隔符或 `..`，以确保接口不能访问 `papers` 根目录之外的位置。
 
-默认 `.env` 已设置为 `./papers/lancedb`。远端 MySQL `papers` 数据库仍是论文主数据源，入库命令通过 `paper_id` 将摘要级文本和向量同步到本机 LanceDB；未来可在保持同一关联键的前提下扩展为 PDF 全文分段。
+默认 `.env` 已设置为 `./papers/lancedb`。远端 MySQL `papers` 数据库仍是论文主数据源，入库命令通过 `paper_id` 将摘要级文本和向量同步到本机 LanceDB。MinerU 的 PDF、结果 ZIP 和 `full.md` 缓存在 `papers/mineru_cache`，该目录已被 Git 忽略。
 
 ## 2026.8.19：从被动回复到主动论文运营
 

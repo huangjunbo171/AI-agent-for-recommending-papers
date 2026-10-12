@@ -1,6 +1,8 @@
+import json
 import random
 import os
 import sys 
+from typing import Sequence
 pythonpath = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0,pythonpath)
 
@@ -535,3 +537,80 @@ user_reflective_rewrite_chinese = '''
 【输出模式】：
 只输出“最终文案正文”；若合适则原样返回该“生成内容”，若不合适则返回你改写后的版本；禁止任何解释或多余字符。
 '''
+
+
+def analyze_paper_metadata_prompt() -> str:
+    """返回中文编写、要求英文结果的论文全文分析 Prompt。"""
+    return """
+你是一名科研论文全文分析助手。必须以用户提供的 MinerU 论文全文 Markdown
+作为分析依据。原文明确给出的内容应直接提取，其余内容只能在全文证据范围内概括；
+不得补充论文全文没有明确支持的事实、实验结果、数据集或局限性。
+
+必须只返回一个合法 JSON 对象，并且只能包含以下字段：
+{
+  "keywords": [],
+  "research_topics": [],
+  "core_method": "",
+  "datasets": [],
+  "main_contributions": [],
+  "main_results": [],
+  "limitations": [],
+  "code_status": "unknown",
+  "code_url": "",
+  "code_evidence": "",
+  "venue": "",
+  "venue_evidence": ""
+}
+
+字段要求：
+- keywords：恰好 5 个简洁的英文学术关键词。
+- research_topics：3 到 5 个简洁的英文研究主题。
+- core_method：使用 300 到 600 个英文单词详细说明核心方法，生成时以 400 到 500 词
+  为目标且绝不能超过 600 词，并保留自然段。至少覆盖
+  输入或表示、总体流程、关键模块及其交互、训练或优化目标、推理或执行过程、核心创新；
+  公式、损失函数和超参数只在全文明确给出时写入，不得为了凑长度重复或猜测。
+- datasets：只列出论文全文中明确出现的数据集名称。
+- main_contributions：只列出论文全文明确支持的主要贡献。
+- main_results：只列出论文全文明确支持的主要结果。
+- limitations：只列出论文全文明确说明的局限性。
+- code_status：只能是 yes、no 或 unknown。正文明确说明代码当前公开时为 yes；正文明确
+  说明未公开、私有、仅按请求提供或未来才发布时为 no；正文没有说明时为 unknown。
+- code_url：只填写与本文代码明确关联的 GitHub 仓库地址。参考文献中的第三方仓库、
+  被比较工具的仓库或仅用于引用的链接不得填写；没有可靠地址时返回空字符串。
+- code_evidence：从正文原样摘取一段能够支持 code_status 和 code_url 的简短英文证据。
+  必须逐字复制连续原文，不得改写、补词或合并不连续句子；unknown 时必须为空。
+  不得使用 References 或 Bibliography 中的内容作为证据。
+- venue：填写论文已正式接收或发表的会议/期刊官方名称。arXiv 只是来源，不是 venue。
+  submitted to 和 under review 不代表已发表；没有可靠证据时返回空字符串。
+- venue_evidence：从 arXiv journal_ref 或正文中原样摘取支持 venue 的英文证据；venue
+  为空时必须为空。证据必须逐字复制连续原文，不得改写；参考文献里的会议或期刊
+  不能作为证据。
+
+所有非空字符串值必须使用英文。数据集名、方法名、缩写和其他专有名词应保持
+官方写法。原文没有提供的信息使用空数组或空字符串，不得猜测。不得添加
+Markdown 代码块、解释、引用或额外字段。
+""".strip()
+
+
+def analyze_paper_metadata_user_prompt(
+    title: str,
+    authors: Sequence[str],
+    categories: Sequence[str],
+    abstract: str,
+    journal_ref: str,
+    full_text: str,
+) -> str:
+    """把论文辅助元数据和 MinerU 全文组织为 DeepSeek 输入。"""
+    return json.dumps(
+        {
+            "metadata": {
+                "title": title,
+                "authors": list(authors),
+                "categories": list(categories),
+                "abstract": abstract,
+                "journal_ref": journal_ref,
+            },
+            "full_text_markdown": full_text,
+        },
+        ensure_ascii=False,
+    )

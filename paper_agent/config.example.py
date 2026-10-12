@@ -60,6 +60,13 @@ DATABASE_INFO = {
 # LanceDB 必须使用 papers 根目录下的子库，部署时可指向服务器挂载目录。
 LANCEDB_PAPERS_PATH = os.environ.get("LANCEDB_PAPERS_PATH", "./papers/lancedb")
 
+# MinerU 与 DashScope 的密钥只允许通过本地环境变量注入，不要写入源码。
+MINERU_BASE_URL = os.environ.get("MINERU_BASE_URL", "https://mineru.net/api/v4")
+DASHSCOPE_EMBEDDING_URL = os.environ.get(
+    "DASHSCOPE_EMBEDDING_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+)
+
 DETAYUN_INFO = {
     "USERNAME": os.environ.get("DETAYUN_USERNAME", ""),
     "PASSWORD": os.environ.get("DETAYUN_PASSWORD", ""),

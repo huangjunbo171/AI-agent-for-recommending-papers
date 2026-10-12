@@ -11,6 +11,8 @@ paper_agent/information/
 QRcode/
 papers/extracted/
 papers/lancedb/
+papers/mineru_cache/
+papers/zip_folder/*.zip
 
 # Python cache/build artifacts
 __pycache__/
