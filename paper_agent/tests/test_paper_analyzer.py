@@ -19,6 +19,7 @@ from utils.paper_analyzer import (  # noqa: E402
     count_english_words,
     detect_english_text,
     parse_analysis_json,
+    strip_analysis_sections,
 )
 
 
@@ -122,6 +123,56 @@ class PaperAnalyzerTest(unittest.TestCase):
         prompt_data = json.loads(user_prompt)
         self.assertEqual("Paper title", prompt_data["metadata"]["title"])
         self.assertIn("Complete method details", prompt_data["full_text_markdown"])
+
+    def test_strips_related_work_and_references_from_markdown(self):
+        """验证预处理删除相关工作和参考文献，但保留后续方法与实验。"""
+        full_text = (
+            "# Paper\n\n## 1 Introduction\nIntroduction text.\n\n"
+            "## 2 Related Work\nRelated comparison.\n\n"
+            "### 2.1 Prior Systems\nPrior system details.\n\n"
+            "## 3 Method\nMethod details.\n\n"
+            "## 4 Experiments\nExperiment details.\n\n"
+            "## References\nReference entry."
+        )
+
+        cleaned = strip_analysis_sections(full_text)
+
+        self.assertIn("Introduction text", cleaned)
+        self.assertIn("Method details", cleaned)
+        self.assertIn("Experiment details", cleaned)
+        self.assertNotIn("Related comparison", cleaned)
+        self.assertNotIn("Prior system details", cleaned)
+        self.assertNotIn("Reference entry", cleaned)
+
+    def test_strips_mineru_html_split_section_titles(self):
+        """验证 MinerU 插入 HTML 标签后仍能识别相关工作与参考文献。"""
+        full_text = (
+            "# Paper\n\n## 1<sub>.</sub> Introduction\nIntroduction.\n\n"
+            "## 2<sub>.</sub> R<sub>e</sub>lated W<sub>or</sub>k\nPrior work.\n\n"
+            "## 3<sub>.</sub> Method\nMethod details.\n\n"
+            "## Referen<sub>c</sub>e<sub>s</sub>\nReference entry."
+        )
+
+        cleaned = strip_analysis_sections(full_text)
+
+        self.assertIn("Introduction", cleaned)
+        self.assertIn("Method details", cleaned)
+        self.assertNotIn("Prior work", cleaned)
+        self.assertNotIn("Reference entry", cleaned)
+
+    def test_strips_unnumbered_literature_review(self):
+        """验证未编号的综述标题不会被误当罗马数字编号而漏删。"""
+        full_text = (
+            "# Paper\n\n## Literature Review\nPrior system details.\n\n"
+            "## II Method\nMethod details.\n\n"
+            "## III References\nReference entry."
+        )
+
+        cleaned = strip_analysis_sections(full_text)
+
+        self.assertIn("Method details", cleaned)
+        self.assertNotIn("Prior system details", cleaned)
+        self.assertNotIn("Reference entry", cleaned)
 
     def test_core_method_preserves_paragraphs_and_word_count(self):
         """验证详细方法达到词数要求并保留自然段。"""
@@ -252,10 +303,16 @@ class PaperAnalyzerTest(unittest.TestCase):
         }
         waits = []
 
+        paper = _paper()
+        paper.full_text = (
+            "# Paper\n\n## Related Work\nComparison that must be removed.\n\n"
+            "## Method\nThe full paper describes a controlled benchmark.\n\n"
+            "## References\nReference that must be removed."
+        )
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test"}), patch(
             "utils.paper_analyzer.httpx.post", side_effect=[first, second]
         ) as request:
-            result = DeepSeekAnalyzer(sleep=waits.append).analyze(_paper())
+            result = DeepSeekAnalyzer(sleep=waits.append).analyze(paper)
 
         self.assertEqual(english, result)
         self.assertEqual(2, request.call_count)
@@ -263,6 +320,11 @@ class PaperAnalyzerTest(unittest.TestCase):
         request_payload = request.call_args_list[0].kwargs["json"]
         user_content = request_payload["messages"][1]["content"]
         self.assertIn("The full paper describes", user_content)
+        self.assertNotIn("Comparison that must be removed", user_content)
+        self.assertNotIn("Reference that must be removed", user_content)
+        self.assertGreater(
+            paper.raw_metadata["analysis_preprocessing"]["removed_chars"], 0
+        )
 
 
 if __name__ == "__main__":

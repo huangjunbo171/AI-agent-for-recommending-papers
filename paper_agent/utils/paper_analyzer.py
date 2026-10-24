@@ -38,8 +38,24 @@ SCALAR_FIELDS = (
 )
 CODE_STATUSES = {"yes", "no", "unknown"}
 CJK_PATTERN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
-REFERENCES_HEADING_PATTERN = re.compile(
-    r"(?im)^\s*(?:#{1,6}\s*)?(?:references|bibliography)\s*$"
+MARKDOWN_HEADING_PATTERN = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*$")
+SECTION_NUMBER_PATTERN = re.compile(
+    r"^\s*(?:(?:\d+(?:\.\d+)*)|(?:[ivxlcdm]+))(?=[.)\s:–—-])"
+    r"[.)]?\s*[-:–—.]?\s*",
+    re.IGNORECASE,
+)
+PLAIN_REFERENCES_PATTERN = re.compile(
+    r"(?im)^\s*(?:references|bibliography|works cited|literature cited)\s*$"
+)
+REFERENCE_SECTION_TITLES = {
+    "references",
+    "bibliography",
+    "works cited",
+    "literature cited",
+}
+RELATED_WORK_SECTION_PATTERN = re.compile(
+    r"\b(?:related works?|literature review|previous works?|prior works?)\b",
+    re.IGNORECASE,
 )
 GITHUB_REPOSITORY_PATTERN = re.compile(
     r"https?://(?:www\.)?github\.com/"
@@ -120,6 +136,58 @@ def validate_full_text(full_text: str, max_chars: int) -> str:
     return content
 
 
+def _normalize_section_title(value: str) -> str:
+    """清理 Markdown 标题中的编号和格式字符，供章节类型识别。"""
+    # MinerU 可能把单词拆成 Referen<sub>c</sub>es，先去除内联 HTML 标签。
+    title = re.sub(r"<[^>]+>", "", value)
+    title = re.sub(r"[*_`~]+", "", title)
+    title = re.sub(r"\s*\{#[^}]+\}\s*$", "", title)
+    title = SECTION_NUMBER_PATTERN.sub("", title)
+    title = re.sub(r"[^a-z]+", " ", title.casefold())
+    return " ".join(title.split())
+
+
+def strip_analysis_sections(full_text: str) -> str:
+    """删除 Related Work 章节，并从参考文献章节开始截断全文。
+
+    参数:
+        full_text: MinerU 生成的 Markdown 全文。
+
+    返回:
+        保留标题、摘要、方法、实验和结论等章节的正文。
+    """
+    lines = (full_text or "").splitlines(keepends=True)
+    kept: List[str] = []
+    skipped_related_level: Optional[int] = None
+
+    for line in lines:
+        heading = MARKDOWN_HEADING_PATTERN.match(line)
+        if heading:
+            level = len(heading.group(1))
+            title = _normalize_section_title(heading.group(2))
+            if title in REFERENCE_SECTION_TITLES or title.startswith("references "):
+                break
+
+            # Related Work 的子标题一并删除，遇到同级或更高级标题后恢复保留。
+            if skipped_related_level is not None:
+                if level > skipped_related_level:
+                    continue
+                skipped_related_level = None
+            if RELATED_WORK_SECTION_PATTERN.search(title):
+                skipped_related_level = level
+                continue
+        elif skipped_related_level is not None:
+            continue
+
+        kept.append(line)
+
+    cleaned = "".join(kept).strip()
+    plain_reference = PLAIN_REFERENCES_PATTERN.search(cleaned)
+    if plain_reference:
+        cleaned = cleaned[: plain_reference.start()].strip()
+    return cleaned
+
+
 def _normalize_multiline_text(value: str) -> str:
     """清理多段文本中的多余空白，同时保留自然段。"""
     lines = [" ".join(line.split()) for line in value.replace("\r", "").split("\n")]
@@ -137,9 +205,8 @@ def _normalize_multiline_text(value: str) -> str:
 
 
 def _main_text_without_references(full_text: str) -> str:
-    """返回参考文献标题之前的正文，供代码和 venue 证据校验。"""
-    match = REFERENCES_HEADING_PATTERN.search(full_text)
-    return full_text[: match.start()] if match else full_text
+    """返回已去除 Related Work 和参考文献的正文供证据校验。"""
+    return strip_analysis_sections(full_text)
 
 
 def _normalize_evidence_text(value: str) -> str:
@@ -403,9 +470,16 @@ class DeepSeekAnalyzer:
 
     def analyze(self, paper: Paper) -> Dict[str, Any]:
         """基于 MinerU 全文分析论文，临时错误或非法输出最多重试三次。"""
+        source_text = (paper.full_text or "").strip()
         full_text = validate_full_text(
-            paper.full_text, self.max_full_text_chars
+            strip_analysis_sections(source_text), self.max_full_text_chars
         )
+        paper.raw_metadata["analysis_preprocessing"] = {
+            "source_chars": len(source_text),
+            "analysis_chars": len(full_text),
+            "removed_chars": max(0, len(source_text) - len(full_text)),
+            "related_work_and_references_removed": True,
+        }
         payload = {
             "model": self.model,
             "messages": [
@@ -423,6 +497,9 @@ class DeepSeekAnalyzer:
                 },
             ],
             "temperature": 0.1,
+            # 校内兼容接口关闭思考模式，避免长全文分析耗时过长且保证 JSON 输出稳定。
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
             "max_tokens": 4500,
             "stream": False,
         }
@@ -437,7 +514,8 @@ class DeepSeekAnalyzer:
                     f"{self.base_url}/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=120,
+                    # 全文请求在校内兼容接口上可能需要数分钟，避免过早超时后重复排队。
+                    timeout=httpx.Timeout(600, connect=30),
                     follow_redirects=True,
                 )
                 if response.status_code in (401, 403):
@@ -459,6 +537,11 @@ class DeepSeekAnalyzer:
                 raise
             except ValueError as exc:
                 last_error = exc
+                print(
+                    f"DeepSeek 分析 {paper.arxiv_id} 第 {attempt + 1}/3 次"
+                    f"内容校验失败：{exc}",
+                    flush=True,
+                )
                 if attempt < 2:
                     # 把具体校验原因反馈给模型，避免三次重复同一格式错误。
                     payload["messages"].append(
@@ -481,6 +564,11 @@ class DeepSeekAnalyzer:
                 IndexError,
             ) as exc:
                 last_error = exc
+                print(
+                    f"DeepSeek 分析 {paper.arxiv_id} 第 {attempt + 1}/3 次"
+                    f"请求失败：{type(exc).__name__}",
+                    flush=True,
+                )
                 if attempt < 2:
                     self._sleep(float(2 ** attempt))
         raise IngestError(

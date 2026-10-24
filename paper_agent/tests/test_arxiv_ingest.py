@@ -16,6 +16,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 analyze_paper_metadata_prompt = MODULE.analyze_paper_metadata_prompt
+arxiv_candidate_pool_size = MODULE.arxiv_candidate_pool_size
 build_embedding_text = MODULE.build_embedding_text
 build_lancedb_records = MODULE.build_lancedb_records
 canonical_arxiv_id = MODULE.canonical_arxiv_id
@@ -76,6 +77,16 @@ class ArxivIngestTest(unittest.TestCase):
         """验证新版 arXiv ID 的版本号清理和稳定主键生成。"""
         self.assertEqual("2609.10522", canonical_arxiv_id("2609.10522v3"))
         self.assertEqual(260910522, stable_paper_id("2609.10522v3"))
+
+    def test_candidate_pool_expands_for_one_hundred_papers(self):
+        """验证百篇入库会读取足够候选，同时遵守 200 篇上限。"""
+        self.assertEqual(30, arxiv_candidate_pool_size(10))
+        self.assertEqual(200, arxiv_candidate_pool_size(100))
+
+    def test_paper_count_is_command_line_alias_for_limit(self):
+        """验证命令行可直接指定本次需要成功入库的论文数量。"""
+        args = MODULE.build_parser().parse_args(["--paper-count", "100"])
+        self.assertEqual(100, args.limit)
 
     def test_legacy_id_is_stable_positive_int(self):
         """验证旧版 arXiv ID 能生成稳定的正整数主键。"""
@@ -148,7 +159,8 @@ class ArxivIngestTest(unittest.TestCase):
         """验证分析 Prompt 集中要求英文输出且字段名保持不变。"""
         prompt = analyze_paper_metadata_prompt()
         self.assertIn("所有非空字符串值必须使用英文", prompt)
-        self.assertIn("必须以用户提供的 MinerU 论文全文", prompt)
+        self.assertIn("必须以用户提供的 MinerU 论文正文", prompt)
+        self.assertIn("删除 Related Work、References 和 Bibliography", prompt)
         self.assertIn("300 到 600 个英文单词", prompt)
         for field in (
             "keywords",
@@ -267,6 +279,97 @@ class ArxivIngestTest(unittest.TestCase):
         self.assertEqual("unknown", english.is_code_open_source)
         self.assertIsNone(english.venue)
 
+    def test_authentication_failure_stops_candidate_processing(self):
+        """验证鉴权失败会终止处理，而不是跳过当前论文并继续请求。"""
+        paper = parse_arxiv_feed(ATOM_FIXTURE)[0]
+        analyzer = Mock()
+        analyzer.analyze.side_effect = MODULE.AuthenticationError("认证失败")
+        mineru = Mock(model_version="vlm")
+        mineru.extract_batch.return_value = MODULE.MinerUBatchOutcome(
+            extractions={paper.paper_id: Mock()}
+        )
+        summary = {
+            "pdf_downloaded": 0,
+            "mineru_parsed": 0,
+            "mineru_field_fallbacks": 0,
+            "full_text_loaded": 0,
+            "non_english_skipped": 0,
+            "analyzed": 0,
+            "skipped": 0,
+            "failures": [],
+        }
+
+        with patch.object(
+            MODULE, "apply_mineru_extraction", return_value=0
+        ), patch.object(MODULE, "_record_language", return_value=True):
+            with self.assertRaises(MODULE.AuthenticationError):
+                prepare_papers_with_mineru(
+                    [paper, replace(paper, paper_id=paper.paper_id + 1)],
+                    1,
+                    mineru,
+                    analyzer,
+                    summary,
+                )
+
+        analyzer.analyze.assert_called_once()
+        mineru.extract_batch.assert_called_once()
+        self.assertEqual(0, summary["skipped"])
+
+    def test_mineru_batches_are_limited_to_fifty_documents(self):
+        """验证百篇入库时 MinerU 请求会拆成不超过 50 篇的批次。"""
+        base = parse_arxiv_feed(ATOM_FIXTURE)[0]
+        papers = [
+            replace(
+                base,
+                paper_id=index,
+                arxiv_id=f"2610.{index:05d}",
+                raw_metadata={},
+            )
+            for index in range(1, 52)
+        ]
+        analyzer = Mock()
+        analyzer.analyze.return_value = _valid_analysis_payload()
+        mineru = Mock(model_version="vlm")
+
+        def extract(documents):
+            """为每个 MinerU 测试批次构造成功解析结果。"""
+            return MODULE.MinerUBatchOutcome(
+                extractions={
+                    document.paper_id: MODULE.MinerUExtraction(
+                        paper_id=document.paper_id,
+                        title=document.fallback_title,
+                        abstract=document.fallback_abstract,
+                        title_source="mineru",
+                        abstract_source="mineru",
+                        markdown_path=Path("full.md"),
+                        full_text="# Paper\n\n## Method\nFull method details.",
+                    )
+                    for document in documents
+                }
+            )
+
+        mineru.extract_batch.side_effect = extract
+        summary = {
+            "pdf_downloaded": 0,
+            "mineru_parsed": 0,
+            "mineru_field_fallbacks": 0,
+            "full_text_loaded": 0,
+            "non_english_skipped": 0,
+            "analyzed": 0,
+            "skipped": 0,
+            "failures": [],
+        }
+
+        prepared = prepare_papers_with_mineru(
+            papers, 51, mineru, analyzer, summary
+        )
+
+        self.assertEqual(51, len(prepared))
+        self.assertEqual(
+            [50, 1],
+            [len(call.args[0]) for call in mineru.extract_batch.call_args_list],
+        )
+
     def test_reanalyze_dry_run_does_not_write_any_store(self):
         """验证已有论文英文重分析 dry-run 不写 MySQL 或 LanceDB。"""
         paper = parse_arxiv_feed(ATOM_FIXTURE)[0]
@@ -295,6 +398,86 @@ class ArxivIngestTest(unittest.TestCase):
         self.assertEqual("# Full paper\nContent", paper.full_text)
         self.assertEqual(1, len(result["planned_updates"]))
         repository.upsert_analysis_batch.assert_not_called()
+        store_class.assert_not_called()
+
+    def test_lancedb_validation_allows_existing_extra_papers(self):
+        """验证持续追加时 LanceDB 中已有旧论文不会导致本批校验失败。"""
+        paper = parse_arxiv_feed(ATOM_FIXTURE)[0]
+        repository = Mock()
+        repository.load_recent.return_value = [paper]
+        repository.complete_ids.return_value = [paper.paper_id]
+        store = Mock()
+        store.upsert_embeddings.return_value = 1
+        store.paper_ids.return_value = [999, paper.paper_id]
+        embedder = SimpleNamespace(model_name="text-embedding-v4")
+        args = SimpleNamespace(
+            limit=1,
+            reanalyze_existing=False,
+            sync_lancedb_only=True,
+            embedding_provider="dashscope",
+            embedding_model="text-embedding-v4",
+            dry_run=False,
+        )
+
+        def prepare(papers, provider, model):
+            """为跨库校验测试补充合法向量。"""
+            papers[0].embedding_text = build_embedding_text(papers[0])
+            papers[0].vector = [1.0] + [0.0] * 1023
+            return embedder
+
+        with patch.object(
+            MODULE, "MySQLPaperRepository", return_value=repository
+        ), patch.object(
+            MODULE, "prepare_embeddings", side_effect=prepare
+        ), patch.object(
+            MODULE, "LanceDBPaperStore", return_value=store
+        ):
+            result = ingest(args)
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(1, result["lancedb_written"])
+
+    def test_analysis_only_writes_mysql_without_embedding(self):
+        """验证分析模式只写 MySQL，不调用向量模型或 LanceDB。"""
+        paper = parse_arxiv_feed(ATOM_FIXTURE)[0]
+        paper.analysis = _valid_analysis_payload()
+        repository = Mock()
+        repository.complete_ids.return_value = [paper.paper_id]
+        analyzer = Mock(model="deepseek-flash")
+        args = SimpleNamespace(
+            limit=1,
+            reanalyze_existing=False,
+            sync_lancedb_only=False,
+            skip_embedding=True,
+            category="cs.AI",
+            provider="deepseek",
+            mineru_model="vlm",
+            analysis_workers=4,
+            dry_run=False,
+        )
+
+        with patch.object(
+            MODULE, "MySQLPaperRepository", return_value=repository
+        ), patch.object(
+            MODULE, "fetch_arxiv_papers", return_value=[paper]
+        ), patch.object(
+            MODULE, "DeepSeekAnalyzer", return_value=analyzer
+        ), patch.object(
+            MODULE, "MinerUClient"
+        ), patch.object(
+            MODULE, "prepare_papers_with_mineru", return_value=[paper]
+        ), patch.object(
+            MODULE, "prepare_embeddings"
+        ) as prepare_embeddings_mock, patch.object(
+            MODULE, "LanceDBPaperStore"
+        ) as store_class:
+            result = ingest(args)
+
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["embedding_skipped"])
+        self.assertEqual(1, result["mysql_written"])
+        repository.upsert_batch.assert_called_once_with([paper], "deepseek-flash")
+        prepare_embeddings_mock.assert_not_called()
         store_class.assert_not_called()
 
 

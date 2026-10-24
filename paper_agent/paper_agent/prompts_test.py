@@ -542,8 +542,10 @@ user_reflective_rewrite_chinese = '''
 def analyze_paper_metadata_prompt() -> str:
     """返回中文编写、要求英文结果的论文全文分析 Prompt。"""
     return """
-你是一名科研论文全文分析助手。必须以用户提供的 MinerU 论文全文 Markdown
-作为分析依据。原文明确给出的内容应直接提取，其余内容只能在全文证据范围内概括；
+你是一名科研论文全文分析助手。必须以用户提供的 MinerU 论文正文 Markdown
+作为分析依据。程序已在提交前删除 Related Work、References 和 Bibliography，避免
+相关工作与参考文献污染本文的方法和贡献提取。原文明确给出的内容应直接提取，
+其余内容只能在当前正文证据范围内概括；
 不得补充论文全文没有明确支持的事实、实验结果、数据集或局限性。
 
 必须只返回一个合法 JSON 对象，并且只能包含以下字段：

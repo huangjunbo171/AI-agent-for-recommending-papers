@@ -4,7 +4,7 @@
 
 ## arXiv 论文基础入库链路
 
-`paper_agent/paper_agent/arxiv_ingest.py` 会按提交时间抓取 arXiv 指定分类的最新英文论文，下载 PDF 后由 MinerU 生成 `full.md`，并从中确定标题和摘要。DeepSeek 以完整的 `full.md` 正文为主要依据生成英文结构化分析，标题、作者、分类和摘要只作为辅助元数据；程序不会退回到仅根据摘要分析。`core_method` 会生成 300～600 个英文词的详细方法说明，覆盖方法流程、关键模块、训练或推理过程、目标函数和核心创新，但不会补写正文没有的信息。
+`paper_agent/paper_agent/arxiv_ingest.py` 会按提交时间抓取 arXiv 指定分类的最新英文论文，下载 PDF 后由 MinerU 生成 `full.md`，并从中确定标题和摘要。程序会先按 Markdown 章节删除 Related Work 及其子章节，并从 References 或 Bibliography 开始截断，再把清理后的正文提交给 DeepSeek。标题、作者、分类和摘要只作为辅助元数据；程序不会退回到仅根据摘要分析。`core_method` 会生成 300～600 个英文词的详细方法说明，覆盖方法流程、关键模块、训练或推理过程、目标函数和核心创新，但不会补写正文没有的信息。
 
 程序还会依据正文保守判断代码开放状态：明确开放为 `yes/1`，明确未开放或声明未来发布为 `no/0`，正文没有可靠说明时为 `unknown/NULL`。只有正文明确关联到本文代码的 GitHub 仓库才会写入 `code_url`，参考文献中的第三方链接不会被采用。`papers_source.source` 固定表示抓取来源 `arxiv`；`papers_info.venue` 只保存 `journal_ref` 或正文明确说明已经接收、发表的会议或期刊，`arXiv`、投稿中和审稿中均不算 venue。引用量字段目前不由这条链路更新。
 
@@ -34,11 +34,14 @@ python -m pip install -r paper_agent\requirements-ingest.txt
 python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --limit 1 --provider deepseek --embedding-provider dashscope --embedding-model text-embedding-v4 --mineru-model vlm --dry-run
 ```
 
-确认单篇输出正常后，使用 10 篇参数正式入库。重复执行会按稳定的 `paper_id` 更新记录，不会重复插入：
+确认单篇输出正常后，通过 `--paper-count`（或兼容参数 `--limit`）指定本次成功入库的论文数量。普通模式支持 1～100 篇，MinerU 会自动按每批最多 50 篇处理，重复执行会按稳定的 `paper_id` 更新记录：
 
 ```powershell
-python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --limit 10 --provider deepseek --embedding-provider dashscope --embedding-model text-embedding-v4 --mineru-model vlm
+python paper_agent\paper_agent\arxiv_ingest.py --category cs.AI --paper-count 90 --provider deepseek --embedding-provider dashscope --embedding-model text-embedding-v4 --mineru-model vlm
 ```
+
+如需先完成 PDF 解析、DeepSeek 全文分析和 MySQL 写入，暂不生成向量，可增加
+`--skip-embedding`（或 `--analysis-only`）。该模式不会调用 DashScope，也不会写 LanceDB。
 
 如果 MySQL 已完成、仅需修复本地向量库，可使用：
 
@@ -79,7 +82,18 @@ store.ensure_schema()  # 仅在旧表为空时允许升级 Schema
 print(store.validate_schema())
 ```
 
-标准表 `paper_embeddings` 只包含 `paper_id`、`title`、`abstract`、`embedding_text`、`embedding_model` 和 1024 维 `vector` 六个非空字段。子库名不允许包含绝对路径、目录分隔符或 `..`，以确保接口不能访问 `papers` 根目录之外的位置。
+标准表 `paper_embeddings` 使用以下六个字段：
+
+| **字段名** | **含义** | **备注** |
+| --- | --- | --- |
+| `paper_id` | 论文唯一 ID，与 MySQL 中的 ID 一致 | |
+| `title` | 论文标题 | 优先使用 MinerU 从全文提取的标题 |
+| `abstract` | 论文摘要 | 优先使用 MinerU 从全文提取的摘要 |
+| `embedding_text` | 用于生成向量的文本 | 格式为 `Title: ...\nAbstract: ...` |
+| `embedding_model` | 向量模型名称 | |
+| `vector` | 论文向量 | |
+
+子库名不允许包含绝对路径、目录分隔符或 `..`，以确保接口不能访问 `papers` 根目录之外的位置。
 
 默认 `.env` 已设置为 `./papers/lancedb`。远端 MySQL `papers` 数据库仍是论文主数据源，入库命令通过 `paper_id` 将摘要级文本和向量同步到本机 LanceDB。MinerU 的 PDF、结果 ZIP 和 `full.md` 缓存在 `papers/mineru_cache`，该目录已被 Git 忽略。
 

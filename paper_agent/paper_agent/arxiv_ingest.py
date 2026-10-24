@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -15,6 +16,9 @@ import httpx
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "paper_agent"
 MINERU_CACHE_ROOT = (PROJECT_ROOT / "papers" / "mineru_cache").resolve()
+MAX_MINERU_BATCH_SIZE = 50
+MAX_NORMAL_INGEST_LIMIT = 100
+MAX_ARXIV_CANDIDATES = 200
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from paper_agent.prompts_test import (  # noqa: E402
@@ -72,6 +76,11 @@ def build_embedding_text(paper: Paper) -> str:
     if not title or not abstract:
         raise IngestError(f"论文 {paper.arxiv_id} 的标题或摘要为空")
     return f"Title: {title}\nAbstract: {abstract}"
+
+
+def arxiv_candidate_pool_size(limit: int) -> int:
+    """按目标数量扩大 arXiv 候选池，并限制单次最多读取 200 篇。"""
+    return max(30, min(limit * 2, MAX_ARXIV_CANDIDATES))
 
 
 def build_lancedb_records(
@@ -202,8 +211,9 @@ def prepare_papers_with_mineru(
     mineru: MinerUClient,
     analyzer: DeepSeekAnalyzer,
     summary: Dict[str, Any],
+    analysis_workers: int = 1,
 ) -> List[Paper]:
-    """持续解析候选并跳过非英文或失败论文，直到补足目标数量。"""
+    """批量解析 PDF，并发分析英文论文，直到补足目标数量。"""
     prepared: List[Paper] = []
     used_ids: set[int] = set()
     candidate_index = 0
@@ -211,7 +221,8 @@ def prepare_papers_with_mineru(
     while candidate_index < len(candidates) and len(prepared) < limit:
         remaining = limit - len(prepared)
         batch: List[Paper] = []
-        while candidate_index < len(candidates) and len(batch) < remaining:
+        batch_size = min(remaining, MAX_MINERU_BATCH_SIZE)
+        while candidate_index < len(candidates) and len(batch) < batch_size:
             paper = candidates[candidate_index]
             candidate_index += 1
             if paper.paper_id in used_ids:
@@ -245,6 +256,7 @@ def prepare_papers_with_mineru(
 
         summary["pdf_downloaded"] += outcome.pdf_downloaded
         summary["mineru_parsed"] += len(outcome.extractions)
+        papers_to_analyze: List[Paper] = []
         for paper in batch:
             extraction = outcome.extractions.get(paper.paper_id)
             if extraction is None:
@@ -267,19 +279,38 @@ def prepare_papers_with_mineru(
                     f"({language['detected']}, {language['confidence']})"
                 )
                 continue
-            try:
-                paper.analysis = analyzer.analyze(paper)
-                apply_analysis_metadata(paper, paper.analysis)
-            except (IngestError, ValueError, httpx.HTTPError) as exc:
-                summary["skipped"] += 1
-                summary["failures"].append(f"{paper.arxiv_id}: {exc}")
-                continue
-            prepared.append(paper)
-            summary["analyzed"] = len(prepared)
-            print(
-                f"已分析 {len(prepared)}/{limit}：{paper.arxiv_id} {paper.title}",
-                flush=True,
-            )
+
+            papers_to_analyze.append(paper)
+
+        # 全文分析是链路中最耗时的阶段，使用有限并发复用已验证的校内接口。
+        worker_count = min(analysis_workers, len(papers_to_analyze))
+        if worker_count == 0:
+            continue
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_papers: Dict[Future[Dict[str, Any]], Paper] = {
+                executor.submit(analyzer.analyze, paper): paper
+                for paper in papers_to_analyze
+            }
+            for future in as_completed(future_papers):
+                paper = future_papers[future]
+                try:
+                    paper.analysis = future.result()
+                    apply_analysis_metadata(paper, paper.analysis)
+                except AuthenticationError:
+                    # 密钥失效时取消尚未开始的分析，停止继续消耗候选与接口配额。
+                    for pending in future_papers:
+                        pending.cancel()
+                    raise
+                except (IngestError, ValueError, httpx.HTTPError) as exc:
+                    summary["skipped"] += 1
+                    summary["failures"].append(f"{paper.arxiv_id}: {exc}")
+                    continue
+                prepared.append(paper)
+                summary["analyzed"] = len(prepared)
+                print(
+                    f"已分析 {len(prepared)}/{limit}：{paper.arxiv_id} {paper.title}",
+                    flush=True,
+                )
 
     if len(prepared) < limit:
         details = "; ".join(summary["failures"][:3])
@@ -380,14 +411,48 @@ def ingest(args: argparse.Namespace) -> Dict[str, Any]:
                 f"MySQL 只有 {len(prepared)} 篇完整论文，目标为 {args.limit}"
             )
     else:
-        candidates = fetch_arxiv_papers(args.category, max_results=30)
+        candidates = fetch_arxiv_papers(
+            args.category, max_results=arxiv_candidate_pool_size(args.limit)
+        )
         summary["fetched"] = len(candidates)
         analyzer = DeepSeekAnalyzer(args.provider)
         llm_model_name = analyzer.model
         mineru = MinerUClient(model_version=args.mineru_model)
         prepared = prepare_papers_with_mineru(
-            candidates, args.limit, mineru, analyzer, summary
+            candidates,
+            args.limit,
+            mineru,
+            analyzer,
+            summary,
+            analysis_workers=getattr(args, "analysis_workers", 1),
         )
+
+    # 分析模式只把完整论文与 LLM 结果写入 MySQL，明确跳过向量接口和 LanceDB。
+    if getattr(args, "skip_embedding", False):
+        expected_ids = sorted(paper.paper_id for paper in prepared)
+        if args.dry_run:
+            summary.update(
+                dry_run=True,
+                embedding_skipped=True,
+                paper_ids=expected_ids,
+                planned_updates=_planned_updates(prepared),
+            )
+            return summary
+        repository.upsert_batch(prepared, llm_model_name)
+        summary["mysql_written"] = len(prepared)
+        mysql_ids = repository.complete_ids(expected_ids)
+        if mysql_ids != expected_ids:
+            raise IngestError(
+                "MySQL 校验失败："
+                f"expected={expected_ids}, mysql={mysql_ids}"
+            )
+        summary.update(
+            embedding_skipped=True,
+            paper_ids=expected_ids,
+            analysis_model=llm_model_name,
+            verified=True,
+        )
+        return summary
 
     embedder = prepare_embeddings(
         prepared, args.embedding_provider, args.embedding_model
@@ -413,11 +478,13 @@ def ingest(args: argparse.Namespace) -> Dict[str, Any]:
 
     expected_ids = sorted(paper.paper_id for paper in prepared)
     mysql_ids = repository.complete_ids(expected_ids)
-    lancedb_ids = sorted(store.paper_ids())
-    if mysql_ids != expected_ids or lancedb_ids != expected_ids:
+    lancedb_ids = set(store.paper_ids())
+    missing_lancedb_ids = sorted(set(expected_ids) - lancedb_ids)
+    if mysql_ids != expected_ids or missing_lancedb_ids:
         raise IngestError(
             "跨库校验失败："
-            f"expected={expected_ids}, mysql={mysql_ids}, lancedb={lancedb_ids}"
+            f"expected={expected_ids}, mysql={mysql_ids}, "
+            f"lancedb_missing={missing_lancedb_ids}"
         )
     summary.update(
         paper_ids=expected_ids,
@@ -431,14 +498,34 @@ def build_parser() -> argparse.ArgumentParser:
     """创建论文入库命令行参数解析器。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--category", default="cs.AI")
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument(
+        "--limit",
+        "--paper-count",
+        dest="limit",
+        type=int,
+        default=10,
+        help="本次需要成功入库的论文数量，普通模式支持 1 到 100",
+    )
     parser.add_argument("--provider", default="deepseek", choices=["deepseek"])
+    parser.add_argument(
+        "--analysis-workers",
+        type=int,
+        default=4,
+        help="DeepSeek 全文分析并发数，默认 4",
+    )
     parser.add_argument(
         "--embedding-provider", default="dashscope", choices=["dashscope", "bge"]
     )
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--mineru-model", default="vlm", choices=["vlm", "pipeline"])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--skip-embedding",
+        "--analysis-only",
+        dest="skip_embedding",
+        action="store_true",
+        help="完成全文解析和分析并写 MySQL，但不生成向量、不写 LanceDB",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--sync-lancedb-only", action="store_true")
     mode.add_argument("--reanalyze-existing", action="store_true")
@@ -452,12 +539,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.limit < 1:
         print(json.dumps({"ok": False, "error": "--limit 必须为正整数"}))
         return 2
-    if args.limit > 30 and not (
+    if args.analysis_workers < 1 or args.analysis_workers > 8:
+        print(
+            json.dumps(
+                {"ok": False, "error": "--analysis-workers 必须在 1 到 8 之间"},
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    if args.skip_embedding and args.sync_lancedb_only:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "--skip-embedding 不能与 --sync-lancedb-only 同时使用",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    if args.limit > MAX_NORMAL_INGEST_LIMIT and not (
         args.sync_lancedb_only or args.reanalyze_existing
     ):
         print(
             json.dumps(
-                {"ok": False, "error": "普通入库模式的 --limit 不能超过 30"},
+                {
+                    "ok": False,
+                    "error": (
+                        "普通入库模式的 --limit 不能超过 "
+                        f"{MAX_NORMAL_INGEST_LIMIT}"
+                    ),
+                },
                 ensure_ascii=False,
             )
         )
