@@ -237,6 +237,39 @@ class MySQLPaperRepository:
         finally:
             connection.close()
 
+        return self._rows_to_papers(rows)
+
+    def load_by_ids(self, paper_ids: Iterable[int]) -> List[Paper]:
+        """按召回顺序批量读取完整论文，缺失的关联记录直接跳过。"""
+        ids = list(dict.fromkeys(int(value) for value in paper_ids))
+        if not ids:
+            return []
+        placeholders = ",".join(["%s"] * len(ids))
+        connection = self.connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT pi.*, ps.source_id, ps.paper_url, ps.pdf_url, ps.raw_metadata,
+                           pa.research_topics, pa.core_method, pa.datasets,
+                           pa.main_contributions, pa.main_results, pa.limitations
+                    FROM papers_info pi
+                    JOIN papers_source ps
+                      ON ps.paper_id=pi.paper_id AND ps.source='arxiv'
+                    JOIN papers_analysis pa ON pa.paper_id=pi.paper_id
+                    WHERE pi.paper_id IN ({placeholders})
+                    """,
+                    ids,
+                )
+                papers = self._rows_to_papers(cursor.fetchall())
+        finally:
+            connection.close()
+        by_id = {paper.paper_id: paper for paper in papers}
+        return [by_id[paper_id] for paper_id in ids if paper_id in by_id]
+
+    @staticmethod
+    def _rows_to_papers(rows: Sequence[Dict[str, Any]]) -> List[Paper]:
+        """统一还原 JSON 分析字段，供入库维护与推荐读取复用。"""
         papers: List[Paper] = []
         for row in rows:
             published = row["published_at"].replace(tzinfo=timezone.utc)

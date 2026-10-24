@@ -307,6 +307,36 @@ class LanceDBPaperStore:
         """兼容旧调用名称，并转发到精简向量表写入实现。"""
         return self.upsert_embeddings(records)
 
+    def search(
+        self, vector: List[float], top_k: int = 5,
+        embedding_model: str = "text-embedding-v4",
+    ) -> List[Dict[str, Any]]:
+        """只读召回同一模型的论文，按余弦距离从小到大返回。"""
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("top_k 必须为正整数")
+        if not embedding_model or not embedding_model.strip():
+            raise ValueError("embedding_model 不能为空")
+        # 复用入库的向量校验，检索时绝不调用可能建表的 ensure_schema。
+        from utils.embedding_provider import normalize_vector
+
+        query_vector = normalize_vector(vector)
+        table = self.open_table()
+        if not self.validate_schema()["valid"]:
+            raise LanceDBSchemaError("检索表结构不符合论文向量约定")
+        model_literal = embedding_model.replace("'", "''")
+        rows = (
+            table.search(query_vector)
+            .distance_type("cosine")
+            .where(f"embedding_model = '{model_literal}'", prefilter=True)
+            .select(["paper_id", "_distance"])
+            .limit(top_k)
+            .to_list()
+        )
+        return [
+            {"paper_id": int(row["paper_id"]), "distance": float(row["_distance"])}
+            for row in rows
+        ]
+
     def paper_ids(self) -> List[int]:
         """返回全部论文 ID，用于与 MySQL 做跨库一致性校验。"""
         table = self.ensure_schema()

@@ -1,5 +1,6 @@
 # from bot.twitter_bot import TwitterBot
 import ast
+import asyncio
 import re
 import sys
 # sys.path.append("D:\\Desktop\\jmrh")
@@ -17,6 +18,7 @@ from collections import defaultdict
 from datetime import datetime
 from utils.prompt import prediction_action,GENERAL_PLAN,filter_interested_content,filter_interested_content_from_following
 from utils.generation import general_generation
+from utils.twitter_targets import collect_target_posts
 import json
 import os
 from utils.sql import sql_dataset
@@ -107,113 +109,136 @@ class TwitterPlanner:
         return topics_information
     
 
-    async def get_target_information(self,account_id,bot):
-        '''获取关注列表 的目标人物的帖子，进行点赞/评论'''
-        
-        # 判断following.txt文件是否存在
-        os.makedirs('./information/followings/twitter/',exist_ok=True)
-        file_path = f'./information/followings/twitter/{account_id}_following.txt'
-        # bot = TwitterBot(log_path=self.log_path)
-        # bot.login(account_id=account_id)
+    @staticmethod
+    def _read_target_person_urls(target_path):
+        target_urls = []
+        seen = set()
+        with open(target_path, "r", encoding="utf-8-sig") as file:
+            for raw_line in file:
+                target_url = raw_line.split(",", 1)[0].strip().rstrip("/")
+                if not re.match(r"^https?://(?:www\.)?(?:x\.com|twitter\.com)/[^/]+$", target_url, re.IGNORECASE):
+                    continue
+                normalized_url = target_url.replace("twitter.com", "x.com")
+                if normalized_url.lower() in seen:
+                    continue
+                seen.add(normalized_url.lower())
+                target_urls.append(normalized_url)
+        return target_urls
+
+    async def get_paper_target_information(self, account_id, bot, target_path):
+        """仅串行论文模式启用实时取帖、敏感过滤和30天名单清理。"""
+        return await collect_target_posts(account_id, bot, target_path, self.log)
+
+    async def get_target_information(
+        self,
+        account_id,
+        bot,
+        target_path=None,
+        sample_size=5,
+        posts_per_target=3,
+    ):
+        '''获取指定大V或关注列表目标人物的近期帖子。'''
+        os.makedirs('./information/followings/twitter/', exist_ok=True)
         time.sleep(1)
-        target_informations = []
-        following_results = []
-        if os.path.exists(file_path):
-            self.log.info(f'账号{account_id}的关注文件存在,可直接读取文件')
-            with open(file_path, "r", encoding="utf-8") as file:
-                following_results = file.readlines()  
-                following_results = [result.strip() for result in following_results]  # 去除每行末尾的换行符
-            if not following_results:
-                self.log.info(f'账号{account_id}的关注文件中无关注列表，获取其关注列表')
-                following_results = bot.get_user_following(account_id=account_id)
+
+        if target_path:
+            if not os.path.exists(target_path):
+                self.log.info(f'大V人物文件不存在：{target_path}')
+                return []
+            following_results = self._read_target_person_urls(target_path)
+            source_name = f'大V人物文件 {target_path}'
         else:
-            self.log.info(f'账号{account_id}的关注文件不存在，获取其关注列表')
-            following_results = bot.get_user_following(account_id=account_id)
-        # 获取目标人物，最近五天发布的帖子
+            file_path = f'./information/followings/twitter/{account_id}_following.txt'
+            following_results = []
+            if os.path.exists(file_path):
+                self.log.info(f'账号{account_id}的关注文件存在，可直接读取文件')
+                with open(file_path, "r", encoding="utf-8") as file:
+                    following_results = [line.strip().rstrip("/") for line in file if line.strip()]
+            if not following_results:
+                self.log.info(f'账号{account_id}的关注文件为空或不存在，获取其关注列表')
+                following_results = bot.get_user_following(account_id=account_id) or []
+            following_results = [
+                str(target).split(",", 1)[0].strip().rstrip("/").replace("twitter.com", "x.com")
+                for target in following_results
+                if str(target).strip()
+            ]
+            source_name = f'账号{account_id}关注列表'
+
+        if not following_results:
+            self.log.info(f'未从{source_name}获得可抓取的目标人物')
+            return []
+
+        selected_targets = random.sample(
+            following_results,
+            min(len(following_results), max(1, int(sample_size))),
+        )
+        self.log.info(f'从{source_name}选择 {len(selected_targets)} 个目标人物：{selected_targets}')
+
+        allowed_targets = None
+        if not target_path:
+            target_urls_path = './data/target_url.txt'
+            if os.path.exists(target_urls_path):
+                allowed_targets = set(self._read_target_person_urls(target_urls_path))
+            else:
+                self.log.info(f'未找到 {target_urls_path}，直接从关注列表抓取目标人物帖子')
+
+        target_informations = []
         current_date = datetime.now().strftime("%Y-%m-%d")
         today = datetime.now()
-        if len(following_results) == 0:
-            self.log.info(f'未获得{account_id}账号的关注列表')
-            # bot.driver.driver.quit()
-            time.sleep(random.uniform(1,3))
-            return target_informations
+        for target_url in selected_targets:
+            if allowed_targets is not None and target_url not in allowed_targets:
+                continue
 
-        sample_size = min(len(following_results), 5)
-        for following in random.sample(following_results, sample_size):
-            time.sleep(random.uniform(1,3))
+            await asyncio.sleep(random.uniform(3, 5))
             target_information = []
-            nickname = following.split('/')[-1]
-            # 三天 爬取一次
-            for i in range(1,4):
-                check_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
-                save_path = f'./information/followings/targets/{nickname}/{check_date}/posts.json'
-                if os.path.exists(save_path):
-                    self.log.info(f'{following}近三天发布的帖子json文件已经存在，可直接读取文件')
-                    with open(save_path, 'r', encoding='utf-8') as file:
-                        for line in file:
+            nickname = target_url.rstrip('/').split('/')[-1]
+            for days_ago in range(0, 4):
+                check_date = (today - timedelta(days=days_ago)).strftime('%Y-%m-%d')
+                cache_path = f'./information/followings/targets/{nickname}/{check_date}/posts.json'
+                if not os.path.exists(cache_path):
+                    continue
+                self.log.info(f'{target_url}近期帖子缓存已存在，读取 {cache_path}')
+                with open(cache_path, 'r', encoding='utf-8') as file:
+                    for line in file:
+                        try:
                             data = json.loads(line.strip())
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(data, dict) and data.get('note_url') and data.get('content'):
                             target_information.append(data)
-                    self.log.info(f'获取到的{following}帖子信息是：{target_information}')
-                    break  # 不再查找下一个日期
-            if len(target_information) == 0: # 不存在文件，则到主页爬取
-                # 检查是否是目标人物的链接
-                target_urls_path = './data/target_url.txt'
-                targets = []
-                if os.path.exists(target_urls_path):
-                    with open(target_urls_path, 'r', encoding='utf-8') as file:
-                        targets = [result.strip() for result in file.readlines() if result.strip()]
-                    targets = [result.strip() for result in targets]  # 去除每行末尾的换行符
-                else:
-                    self.log.info(f'未找到 {target_urls_path}，回退为直接从关注列表抓取目标人物帖子')
-                    targets = [following]
-                if following in targets:
-                    os.makedirs(f'./information/followings/targets/{nickname}/{current_date}',exist_ok=True)
-                    save_path = f'./information/followings/targets/{nickname}/{current_date}/posts.json'
-                    target_information = await bot.scrap_content(account_id=account_id,url=following,time_limit=3,save_path=save_path)
-                    target_information = json.loads(target_information.body.decode()).get("response")
-                    if isinstance(target_information,list):
-                        target_information = [item for item in target_information if item]  # 过滤掉空字典
-                        if len(target_information) != 0:
-                            self.log.info(f'获取到的{following}帖子信息是：{target_information}')  # 可能为空
-                        else:
-                            self.log.info(f'获取到的{following}帖子信息是空的')
-                            continue  # 下一个following
-                    elif isinstance(target_information,str):
-                        self.log.info(f'未获取到{following}有效的帖子信息')
-                        continue
-                else:
-                    continue  # 下一个关注
-            # os.makedirs(f'./information/followings/targets/{nickname}/{current_date}',exist_ok=True)
-            # save_path = f'./information/followings/targets/{nickname}/{current_date}/posts.json'
-            # if os.path.exists(save_path):
-            #     target_information = []
-            #     self.log.info(f'{following}近七天发布的帖子json文件已经存在，可直接读取文件')
-            #     with open(save_path, 'r', encoding='utf-8') as file:
-            #         for line in file:
-            #             data = json.loads(line.strip())
-            #             target_information.append(data)
-            #     self.log.info(f'获取到的{following}帖子信息是：{target_information}')
-            # else:
-            #     # 检查是否是目标人物的链接
-            #     with open('./data/target_url.txt', 'r', encoding='utf-8') as file:
-            #         targets = file.readlines()  
-            #         targets = [result.strip() for result in targets]  # 去除每行末尾的换行符
-            #     if following in targets:
-            #         target_information = await bot.scrap_content(account_id=account_id,url=following,time_limit=5,save_path=save_path)
-            #         target_information = json.loads(target_information.body.decode()).get("response")
-            #         if isinstance(target_information,list):
-            #             self.log.info(f'获取到的{following}帖子信息是：{target_information}')
-            #         elif isinstance(target_information,str):
-            #             self.log.info(f'未获取到{following}有效的帖子信息')
-            #             continue
-            #     else:
-            #         continue
-            time.sleep(random.uniform(1,3))
-            target_informations.extend(target_information)
-            if len(target_information) >=5:
-                break # 总共获取5个信息即可。。。方便运营
-        self.log.info(f'账号{account_id}获取到的目标人物近五天内的帖子信息是：{target_informations}')
-        # bot.driver.driver.quit()
+                break
+
+            if not target_information:
+                save_directory = f'./information/followings/targets/{nickname}/{current_date}'
+                os.makedirs(save_directory, exist_ok=True)
+                save_path = f'{save_directory}/posts.json'
+                response = await bot.scrap_content(
+                    account_id=account_id,
+                    url=target_url,
+                    num=posts_per_target,
+                    time_limit=5,
+                    save_path=save_path,
+                )
+                try:
+                    payload = json.loads(response.body.decode()).get("response")
+                except Exception as error:
+                    self.log.info(f'解析{target_url}帖子抓取结果失败：{error}')
+                    payload = []
+                if isinstance(payload, list):
+                    target_information = [
+                        item for item in payload
+                        if isinstance(item, dict) and item.get('note_url') and item.get('content')
+                    ]
+
+            if target_information:
+                self.log.info(f'获取到{target_url}的 {len(target_information)} 条近期帖子')
+                target_informations.extend(target_information[:posts_per_target])
+            else:
+                self.log.info(f'未获取到{target_url}有效的近期帖子')
+
+        self.log.info(
+            f'账号{account_id}从{source_name}获取到 {len(target_informations)} 条大V候选帖子'
+        )
         return target_informations
 
 

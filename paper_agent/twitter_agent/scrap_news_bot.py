@@ -43,7 +43,8 @@ class ScrapNewsBot():
         无
         """
         super().__init__()
-        self.driver = WebDriver(log_path=log_path,use_proxy=True,headless=True )  # 无头模式 ,headless=True 
+        use_proxy = WebDriver.environment_flag("TWITTER_USE_PROXY", True)
+        self.driver = WebDriver(log_path=log_path,use_proxy=use_proxy,headless=True )  # 无头模式 ,headless=True
         self.log = logger(filename=log_path)
         self.database = sql_dataset('twitter')
 

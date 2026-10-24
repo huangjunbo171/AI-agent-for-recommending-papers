@@ -45,6 +45,9 @@ try:
 except ModuleNotFoundError:
     from finger_generation import FingerprintPersistence
 from datetime import datetime, timezone, timedelta
+from utils.twitter_targets import (
+    TargetFeedResult, build_target_feed, parse_profile_articles, parse_target_line,
+)
 class TwitterBot():
     def __init__(self, log_path: str = "./logs/twitter/twitter_log.log"):
         """
@@ -58,15 +61,18 @@ class TwitterBot():
         """
         super().__init__()
         self.log_path = log_path
-        self.use_proxy = True
+        self.use_proxy = WebDriver.environment_flag("TWITTER_USE_PROXY", True)
         self.headless = True
         self.fingerprint = None
+        self.disabled_profile_paths = set()
         self.driver = WebDriver(
             log_path=log_path,
             use_proxy=self.use_proxy,
             headless=self.headless,
             fingerprint=self.fingerprint,
         )   # ,headless=True
+        self.use_proxy = self.driver.use_proxy
+        self.fingerprint = self.driver.fingerprint
         self.log = logger(filename=log_path)
         self.database = sql_dataset('twitter')
 
@@ -88,20 +94,35 @@ class TwitterBot():
         except Exception:
             return False
 
-    def _rebuild_driver(self, fingerprint=None):
+    def _rebuild_driver(self, fingerprint=None, use_proxy=None):
         try:
             self.driver.driver.quit()
         except Exception:
             pass
         if fingerprint is not None:
             self.fingerprint = fingerprint
+        if use_proxy is not None:
+            self.use_proxy = bool(use_proxy)
         self.driver = WebDriver(
             log_path=self.log_path,
             use_proxy=self.use_proxy,
             headless=self.headless,
             fingerprint=self.fingerprint,
         )
-        self.log.info("webdriver 会话失活，已重建浏览器驱动")
+        self.use_proxy = self.driver.use_proxy
+        if self.driver.failed_profile_path:
+            self.disabled_profile_paths.add(os.path.abspath(self.driver.failed_profile_path))
+        self.fingerprint = self.driver.fingerprint
+        connection_mode = "代理" if self.use_proxy else "直连"
+        self.log.info(f"webdriver 会话失活，已使用{connection_mode}模式重建浏览器驱动")
+
+    def _proxy_connection_failed(self):
+        error_text = getattr(self.driver, "last_navigation_error", "") or ""
+        return self.use_proxy and "ERR_PROXY_CONNECTION_FAILED" in error_text
+
+    def _rebuild_driver_without_proxy(self):
+        self.log.error("检测到浏览器代理连接失败，正在切换为直连模式并重建驱动")
+        self._rebuild_driver(use_proxy=False)
 
     def _load_account_fingerprint(self, account_id):
         try:
@@ -129,6 +150,14 @@ class TwitterBot():
 
     def _prepare_account_driver(self, account_id):
         fingerprint, source = self._load_account_fingerprint(account_id)
+        fingerprint = WebDriver._normalize_fingerprint(fingerprint)
+        profile_path = fingerprint.get("profile_path") if fingerprint else None
+        if profile_path and profile_path in self.disabled_profile_paths:
+            fingerprint = dict(fingerprint)
+            fingerprint.pop("profile_path", None)
+            self.log.info(
+                f"账号{account_id}的浏览器配置目录此前启动失败，本次继续使用临时配置目录"
+            )
         if fingerprint == self.fingerprint:
             return
         self._rebuild_driver(fingerprint=fingerprint)
@@ -832,7 +861,7 @@ class TwitterBot():
             except:
                 self.log.info(f'不存在提示框')
             time.sleep(random.uniform(5,10))
-            content_url = self.get_content_url(account_id=account_id)
+            content_url = self.get_content_url(account_id=account_id, expected_content=content)
             self.log.info(f'获取发布成功帖子的链接:{content_url}')
             # 添加到互动表，
             if content_url:
@@ -843,30 +872,88 @@ class TwitterBot():
                 self.log.info(f'发帖 已更新到数据库twitter互动表')
                 return create_response(create_time=create_time,code=HTTPStatus.OK,message='success',response=f'账号{account_id}发布成功：{content_url}')  
             else:
-                self.log.error(f'账号{account_id}twitter内容发布失败，未获得有效作品链接') 
-                return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}发布失败') 
+                insert_sql = '''INSERT INTO `twitter_interaction`(`Account_id`,`Platform`,`Content`,`Type`,`Action`,`URL`,`Interaction_time`,`Result_list`,`Update_time`) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s);'''
+                self.database.operation(insert_sql,(account_id,'twitter',content,note_type,'发帖',None,action_time,None,datetime.now()))
+                self.log.error(f'账号{account_id}twitter内容已提交，但暂未获得有效作品链接')
+                return create_response(
+                    create_time=create_time,
+                    code=HTTPStatus.OK,
+                    message='success',
+                    response=f'账号{account_id}发布操作已提交，作品链接待确认',
+                )
         except Exception as e:
             self.log.error(f'账号{account_id}twitter内容发布失败，原因是：{e}')
             return create_response(create_time=create_time,code=HTTPStatus.BAD_REQUEST,message='error',response=f'账号{account_id}发布失败') 
     
      
-    def get_content_url(self,account_id):
+    def get_content_url(self, account_id, expected_content=None):
         '''获取账号account_id刚发布的帖子链接'''
         try:
             search_sql = f"SELECT * FROM accounts_info WHERE accounts_info.Account_id = {account_id}"
             result = self.database.get_dict_data_sql(search_sql)
             account_url = result[0]['URL']
+            account_name = result[0].get('Account') or urlparse(account_url).path.strip('/').split('/')[0]
+            account_name = str(account_name).lstrip('@').strip()
+            expected_text = " ".join((expected_content or "").split()).lower()
+
+            def canonical_status_url(href):
+                match = re.search(
+                    r'https?://(?:www\.)?(?:x\.com|twitter\.com)/([^/]+)/status/(\d+)',
+                    href or '',
+                    flags=re.IGNORECASE,
+                )
+                if not match or match.group(1).lower() != account_name.lower():
+                    return None
+                return f'https://x.com/{account_name}/status/{match.group(2)}'
+
+            def find_url_on_page():
+                toast_links = self.driver.driver.find_elements(
+                    By.XPATH,
+                    '//div[@data-testid="toast"]//a[contains(@href,"/status/")]',
+                )
+                for link in toast_links:
+                    content_url = canonical_status_url(link.get_attribute('href'))
+                    if content_url:
+                        return content_url
+
+                fallback_url = None
+                articles = self.driver.driver.find_elements(By.XPATH, '//article[@data-testid="tweet"]')
+                for article in articles:
+                    article_text = " ".join((article.text or "").split()).lower()
+                    status_links = article.find_elements(
+                        By.XPATH,
+                        './/a[contains(@href,"/status/")]',
+                    )
+                    for link in status_links:
+                        content_url = canonical_status_url(link.get_attribute('href'))
+                        if not content_url:
+                            continue
+                        if expected_text and (
+                            expected_text[:80] in article_text
+                            or article_text[:80] in expected_text
+                        ):
+                            return content_url
+                        if fallback_url is None and 'pinned' not in article_text and '置顶' not in article_text:
+                            fallback_url = content_url
+                return fallback_url
+
+            content_url = find_url_on_page()
+            if content_url:
+                self.log.info(f'从发布提示或当前页面获取账号{account_id}的帖子链接成功：{content_url}')
+                return content_url
+
             self.log.info(f'进入twitter账号{account_id}主页:{account_url}')
-            self.driver.get(url = account_url )
-            time.sleep(5)
-            # 第一个twitter帖子
-            first_article_element = self.driver.find_xpath(XPATH='//article[@data-testid="tweet"]')
-            self.driver.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", first_article_element)
-            time.sleep(random.uniform(1,3))
-            a_element = first_article_element.find_element(By.XPATH,'.//div[@class="css-175oi2r r-18u37iz r-1q142lx"]')
-            content_url = a_element.find_element(By.TAG_NAME,'a').get_attribute("href")
-            self.log.info(f'获取账号{account_id}的帖子链接成功，链接是：{content_url}')
-            return content_url     
+            self.driver.get(url=account_url)
+            for attempt in range(3):
+                time.sleep(random.uniform(3, 5))
+                content_url = find_url_on_page()
+                if content_url:
+                    self.log.info(f'获取账号{account_id}的帖子链接成功，链接是：{content_url}')
+                    return content_url
+                if attempt < 2:
+                    self.log.info(f'账号{account_id}最新帖子尚未同步，刷新主页后重试获取链接')
+                    self.driver.driver.refresh()
+            return None
         except Exception as e:
             self.log.error(f'获取twitter账号{account_id}发布的帖子链接失败，原因是：{e}')
             return None
@@ -889,24 +976,39 @@ class TwitterBot():
             data["note_url"] = self.driver.driver.current_url
             html = self.driver.driver.page_source 
             soup = BeautifulSoup(html, "lxml")  # html.parser 
-            href = data["note_url"] .replace('https://x.com','')
-            # 使用正则
-            STATUS_RE = re.compile(r'^(/[^/]+/status/\d+)(?:[/?#].*)?$')
-            m = STATUS_RE.match(href)
-            href =  m.group(1) if m else href
-            # href = href[:-1] if href[-1] == '/' else href
-            a_tag = soup.find('a', href=re.compile(href))
-            article = a_tag.find_parent('article')
+            status_match = re.search(r'/([^/]+)/status/(\d+)', data["note_url"])
+            status_href = (
+                f'/{status_match.group(1)}/status/{status_match.group(2)}'
+                if status_match else ''
+            )
+            article = None
+            if status_href:
+                for candidate in soup.find_all('article'):
+                    candidate_links = candidate.find_all(
+                        'a', href=re.compile(re.escape(status_href) + r'(?:[/?#]|$)')
+                    )
+                    if candidate_links:
+                        article = candidate
+                        break
+            if article is None:
+                article = soup.find('article', attrs={'data-testid': 'tweet'})
+            if article is None:
+                article = soup.find('article', attrs={'role': 'article'})
+            if article is None:
+                raise ValueError(f'未找到帖子详情页主帖元素，current_url={data["note_url"]}')
             # 查找用户昵称
-            data["nickname"] = article.find('div',class_="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs").get_text().strip()
-            data["user_url"] = 'https://x.com/' + data["note_url"].split('/')[3] 
+            nickname_element = article.find('div',class_="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs")
+            data["nickname"] = nickname_element.get_text(" ", strip=True) if nickname_element else ''
+            if not data["nickname"]:
+                data["nickname"] = status_match.group(1) if status_match else ''
+            data["user_url"] = 'https://x.com/' + data["nickname"] if data["nickname"] else ''
             trans_tweets = article.find_all('div',attrs={"data-testid": "tweetText"})
             if len(trans_tweets) == 1:
                 data["note_type"] = '原创'
-                data["content"] = trans_tweets[0].get_text().replace('\n','')
+                data["content"] = trans_tweets[0].get_text(" ", strip=True)
             elif len(trans_tweets) >1 :
                 data["note_type"] = '转发'
-                data["content"] = trans_tweets[0].get_text().replace('\n','')
+                data["content"] = trans_tweets[0].get_text(" ", strip=True)
             else:
                 data["note_type"] = '原创'
                 data["content"] = ''
@@ -920,12 +1022,13 @@ class TwitterBot():
                 data["note_form"] = '视频'
             else:
                 data["note_form"] = '文字'
-            len(article.find_all('time'))
+            time_elements = article.find_all('time')
             if data['note_type'] == '原创':
-                data["post_time_ip"] = article.find('time').get("datetime") if article.find('time') else ''
+                data["post_time_ip"] = time_elements[0].get("datetime", "") if time_elements else ''
             elif data['note_type'] == '转发':
-                data["post_time_ip"] = article.find_all('time')[-1].get("datetime") if article.find('time') else ''
-            text = self.driver.find_xpath(XPATH='//div[contains(@class,"css-175oi2r r-1kbdv8c r-18u37iz r-1oszu61")]').get_attribute("aria-label")  # 贴文的数据量
+                data["post_time_ip"] = time_elements[-1].get("datetime", "") if time_elements else ''
+            metric_elements = article.find_all(attrs={"aria-label": True})
+            text = ' '.join(str(element.get("aria-label") or "") for element in metric_elements)
             results = {"replies": 0,"reposts": 0,"likes": 0,"bookmarks": 0,"views": 0}
             # 单数变成复数
             text = text.replace('like','likes').replace('reply','replies').replace('repost','reposts').replace('bookmark','bookmarks').replace('view','views')
@@ -955,7 +1058,7 @@ class TwitterBot():
             return {}  
 
 
-    async def likes(self,account_id,url):
+    async def likes(self,account_id,url,report_existing=False):
         '''点赞某贴文'''
         '''
         参数：
@@ -986,7 +1089,8 @@ class TwitterBot():
                 try:
                     article.find_element(By.XPATH,'.//button[@data-testid="unlike"]')
                     self.log.info(f'账号{account_id}已经点赞过帖子{url}')
-                    return create_response(create_time=create_time,code=HTTPStatus.OK,message='success',response=f'账号{account_id}点赞成功')
+                    # 新论文流程区分已点赞与本次成功，旧调用仍保持原返回语义。
+                    return create_response(create_time=create_time,code=HTTPStatus.OK,message='already_done' if report_existing else 'success',response=f'账号{account_id}点赞成功')
                 except:
                     raise Exception
             self.log.info("twitter点赞成功")
@@ -1575,6 +1679,41 @@ class TwitterBot():
 
 
      
+    async def get_profile_recent_posts(self, account_id, url, limit=3, days=7):
+        """实时读取大V本人近期帖，并保留未被时间过滤的最新发帖元数据。"""
+        target = parse_target_line(url)
+        if target is None:
+            return TargetFeedResult(status="invalid_target")
+        try:
+            await self._ensure_live_driver(account_id=account_id)
+            self.driver.get(target["url"])
+            WebDriverWait(self.driver.driver, 12).until(
+                lambda driver: driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"]')
+                or driver.find_elements(By.CSS_SELECTOR, '[data-testid="emptyState"]')
+            )
+            if not self._profile_url_matches(self.driver.driver.current_url, target["url"]) or not self._has_logged_in_ui():
+                return TargetFeedResult(status="unavailable")
+            items, seen = [], set()
+            now = datetime.now(timezone.utc)
+            for _ in range(6):
+                for item in parse_profile_articles(self.driver.driver.page_source, target["handle"]):
+                    key = item.get("note_url") or "uncertain"
+                    if key not in seen:
+                        seen.add(key)
+                        items.append(item)
+                feed = build_target_feed(items, now, limit, days)
+                if len(feed.posts) >= limit:
+                    return feed
+                # 确认最新本人帖已早于时间窗后，仍返回时间供30天删号规则判断。
+                if feed.latest_confirmed and feed.latest_post_at < now - timedelta(days=days):
+                    return feed
+                self.driver.driver.execute_script("window.scrollBy(0, 900)")
+                await asyncio.sleep(random.uniform(2, 4))
+            return build_target_feed(items, now, limit, days)
+        except Exception as error:
+            self.log.warning(f"读取大V主页{url}失败，不据此删号：{error}")
+            return TargetFeedResult(status="error")
+
     async def scrap_content(self,account_id,url:str=None,keyword:str=None,num:int=10,time_limit:int=None,save_path:str=None):
         '''
         爬取某网页的曝光内容，支持：用户主页/关键字检索latest页面/home/热搜页面/某帖子页面
@@ -3144,6 +3283,17 @@ class TwitterBot():
             time.sleep(random.uniform(10,15))
             self.driver.swith_to_new_window(id=-1)
             data = await self.get_one_content(account_id=account_id)
+            required_fields = {"note_url", "content", "nickname", "post_time_ip"}
+            if (
+                not data
+                or not required_fields.issubset(data)
+                or not data.get("note_url")
+                or not data.get("content")
+                or not data.get("post_time_ip")
+            ):
+                self.log.info(f'关键词 {keyword} 的帖子详情解析不完整，跳过当前帖子')
+                await self.close_now_windows()
+                return {}, article
             data["keyword"] = keyword
             # data['tweet_type'] = tweet_type
             self.log.info(f'搜索热搜词{keyword}获取的曝光内容是:{data}')

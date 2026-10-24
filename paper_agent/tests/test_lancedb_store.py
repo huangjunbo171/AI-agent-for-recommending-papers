@@ -131,6 +131,27 @@ class LanceDBPaperStoreTest(unittest.TestCase):
                 ]
             )
 
+    def test_real_search_prefilters_models_and_preserves_table(self):
+        """使用临时真实LanceDB验证查询接口及同维不同模型隔离。"""
+        with self._temporary_papers_root() as root:
+            store = LanceDBPaperStore(root_path=root)
+            store.initialize()
+            records = []
+            for paper_id, model, vector in (
+                (1, "text-embedding-v4", [1.0, 0.0]),
+                (2, "BAAI/bge-m3", [1.0, 0.0]),
+                (3, "text-embedding-v4", [0.0, 1.0]),
+            ):
+                records.append(dict(paper_id=paper_id, title="Title", abstract="Abstract",
+                                    embedding_text="Title: Title\nAbstract: Abstract",
+                                    embedding_model=model, vector=vector + [0.0] * 1022))
+            store.upsert_embeddings(records)
+            results = store.search([1.0] + [0.0] * 1023, top_k=2)
+            self.assertEqual([1, 3], [row["paper_id"] for row in results])
+            self.assertLess(results[0]["distance"], results[1]["distance"])
+            self.assertEqual([], store.search([1.0] * 1024, embedding_model="another-model"))
+            self.assertEqual(3, store.open_table().count_rows())
+
     def test_recreates_only_an_empty_incompatible_table(self):
         """验证只有空的旧结构表可以被安全重建。"""
         with self._temporary_papers_root() as root:

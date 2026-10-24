@@ -103,6 +103,18 @@ def _cookie_login_state(bot, expected_profile: str = None, account: str = None):
     return False, profile_href, current_url
 
 
+def _describe_cookie_login_failure(current_url: str):
+    """将 X 的登录重定向页面转换为可操作的诊断信息。"""
+    path = (urlparse(current_url or "").path or "").lower()
+    if "/i/jf/onboarding" in path:
+        return "X 将会话重定向到 onboarding，通常表示 Cookie 已失效或账号需要完成安全验证"
+    if "/i/flow/login" in path or "/login" in path:
+        return "X 仍处于登录流程，当前 Cookie 未建立有效会话"
+    if path in {"", "/home", "/compose/post"}:
+        return "页面未出现可确认登录状态的控件，可能是页面尚未加载完成或登录态未生效"
+    return f"X 未确认登录状态，当前路径为 {path}"
+
+
 def _build_token_ct0_cookies(token: str, ct0: str):
     if not token or not ct0:
         return []
@@ -112,7 +124,6 @@ def _build_token_ct0_cookies(token: str, ct0: str):
             "path": "/",
             "value": token,
             "domain": ".x.com",
-            "expiry": 1785316008,
             "secure": True,
             "httpOnly": True,
             "sameSite": "None",
@@ -122,7 +133,6 @@ def _build_token_ct0_cookies(token: str, ct0: str):
             "path": "/",
             "value": ct0,
             "domain": ".x.com",
-            "expiry": 1785316009,
             "secure": True,
             "httpOnly": False,
             "sameSite": "Lax",
@@ -133,6 +143,58 @@ def _build_token_ct0_cookies(token: str, ct0: str):
 def _contains_auth_cookies(cookies):
     cookie_names = {str(item.get("name", "")).strip() for item in cookies if isinstance(item, dict)}
     return "auth_token" in cookie_names and "ct0" in cookie_names
+
+
+def _normalize_login_cookies(cookies):
+    normalized = []
+    expired_names = []
+    current_timestamp = int(time.time())
+    allowed_fields = {
+        "name",
+        "value",
+        "path",
+        "domain",
+        "secure",
+        "httpOnly",
+        "sameSite",
+        "expiry",
+    }
+
+    for item in cookies or []:
+        if not isinstance(item, dict) or not item.get("name") or item.get("value") is None:
+            continue
+        cookie = {key: value for key, value in item.items() if key in allowed_fields}
+        expiry = cookie.get("expiry")
+        if expiry is not None:
+            try:
+                expiry = int(expiry)
+            except (TypeError, ValueError):
+                cookie.pop("expiry", None)
+            else:
+                if expiry <= current_timestamp:
+                    expired_names.append(str(cookie["name"]))
+                    continue
+                else:
+                    cookie["expiry"] = expiry
+        normalized.append(cookie)
+
+    return normalized, sorted(set(expired_names))
+
+
+def _is_webdriver_infrastructure_error(error):
+    error_text = str(error).lower()
+    return any(
+        marker in error_text
+        for marker in (
+            "devtoolsactiveport file doesn't exist",
+            "chrome failed to start",
+            "session not created",
+            "invalid session id",
+            "disconnected: not connected to devtools",
+            "max retries exceeded with url: /session/",
+            "httpconnectionpool(host='localhost'",
+        )
+    )
 
 
 async def _refresh_profile_after_cookie_login(bot, account_id: int):
@@ -163,13 +225,27 @@ async def cookie_only_login_by_cookies(self, account_id: int, url: str = "https:
             self._prepare_account_driver(account_id)
         if hasattr(self, "_ensure_live_driver"):
             await self._ensure_live_driver(force_reset=not self._driver_session_alive())
-        db_cookies = json.loads(cookies) if cookies else []
+        db_cookies, expired_cookie_names = _normalize_login_cookies(
+            json.loads(cookies) if cookies else []
+        )
+        if expired_cookie_names:
+            self.log.info(
+                f"账号{account_id}的 Cookie 已跳过过期条目："
+                f"{expired_cookie_names}"
+            )
         token_ct0_cookies = _build_token_ct0_cookies(token, ct0)
         login_candidates = []
         if db_cookies:
             login_candidates.append(("cookie", db_cookies))
-            if token_ct0_cookies and not _contains_auth_cookies(db_cookies):
-                self.log.info(f"账号{account_id}的 Cookie 中缺少 auth_token/ct0，回退准备使用 Token + Ct0 登录")
+            if token_ct0_cookies:
+                if not _contains_auth_cookies(db_cookies):
+                    self.log.info(
+                        f"账号{account_id}的 Cookie 中缺少 auth_token/ct0，准备使用 Token + Ct0 兜底"
+                    )
+                else:
+                    self.log.info(
+                        f"账号{account_id}将在完整 Cookie 登录失败后，使用独立 Token + Ct0 再尝试一次"
+                    )
                 login_candidates.append(("token_ct0", token_ct0_cookies))
         elif token_ct0_cookies:
             login_candidates.append(("token_ct0", token_ct0_cookies))
@@ -194,6 +270,21 @@ async def cookie_only_login_by_cookies(self, account_id: int, url: str = "https:
                 await self._ensure_live_driver(account_id=None, force_reset=True)
             try:
                 login_started = self.driver._login(url="https://x.com/home", cookies=candidate_cookies, token=None)
+                if (
+                    login_started is False
+                    and hasattr(self, "_proxy_connection_failed")
+                    and self._proxy_connection_failed()
+                    and hasattr(self, "_rebuild_driver_without_proxy")
+                ):
+                    self.log.info(
+                        f"账号{account_id}使用{candidate_name}登录时代理连接失败，改用直连模式重试一次"
+                    )
+                    self._rebuild_driver_without_proxy()
+                    login_started = self.driver._login(
+                        url="https://x.com/home",
+                        cookies=candidate_cookies,
+                        token=None,
+                    )
                 if login_started is False:
                     self.log.error(f"账号{account_id}使用{candidate_name}注入登录失败，原因: driver login returned false")
                     continue
@@ -223,8 +314,8 @@ async def cookie_only_login_by_cookies(self, account_id: int, url: str = "https:
                 break
 
         if not success:
-            if token_ct0_cookies and "token_ct0" not in [name for name, _ in login_candidates]:
-                self.log.info(f"账号{account_id}准备追加使用 Token + Ct0 进行登录兜底")
+            failure_reason = _describe_cookie_login_failure(current_url)
+            self.log.error(f"账号{account_id} Cookie 登录失败诊断：{failure_reason}")
             self.log.error(f"账号{account_id} cookie 登录校验失败，profile={profile}, detected_profile={href}, current_url={current_url}")
             sql = '''UPDATE accounts_info SET Cookie_Status = %s WHERE Account_id = %s;'''
             self.database.operation(sql, ("下线", account_id))
@@ -265,6 +356,17 @@ async def cookie_only_login_by_cookies(self, account_id: int, url: str = "https:
         if login_verified:
             self.log.error(f"账号{account_id}cookie登录已经验证成功，但后续流程出错，不将cookie标记为下线，原因:{e}")
             return create_response(create_time=create_time, code=HTTPStatus.OK, message="success", response=f"账号{account_id}cookies登录成功")
+        if _is_webdriver_infrastructure_error(e):
+            self.log.error(
+                f"账号{account_id}浏览器驱动启动或会话异常，本次无法校验 Cookie，"
+                f"保留原 Cookie_Status，原因:{e}"
+            )
+            return create_response(
+                create_time=create_time,
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+                message="error",
+                response=f"账号{account_id}浏览器环境不可用，暂未判定 cookies 下线",
+            )
         sql = '''UPDATE accounts_info SET Cookie_Status = %s WHERE Account_id = %s;'''
         self.database.operation(sql, ("下线", account_id))
         self.log.error(f"账号{account_id}cookies下线，利用cookies登录失败，原因:{e}")

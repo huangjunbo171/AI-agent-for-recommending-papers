@@ -29,6 +29,10 @@ from utils.utils import convert_time_us
 from utils.generation import general_generation,general_generation_think,describe_active_provider
 from utils.prompt import generate_paper_keywords_prompt, comment_post_prompt
 import argparse
+import re
+from datetime import timezone
+from utils.paper_recommender import PostRecommendationService
+from utils.twitter_targets import SensitivePersonFilter, utc_time
 
 TwitterBot.login_by_cookies = cookie_only_login_by_cookies
 
@@ -111,14 +115,24 @@ class TwitterAgent():
         self.log.info(f"{phase}，随机等待 {duration:.1f} 秒")
         await asyncio.sleep(duration)
 
-    def _new_proactive_post_state(self):
-        trigger_threshold = random.randint(10, 15)
-        self.log.info(f"主动论文宣传发帖将在完成 {trigger_threshold} 次帖子互动后触发")
+    def _new_proactive_post_state(self, post_first=False):
+        trigger_threshold = 0 if post_first else random.randint(10, 15)
+        interaction_target = random.randint(10, 15) if post_first else None
+        if post_first:
+            self.log.info(
+                f"论文模式将先发布一次论文阅读日记，再对名单大V近期帖子进行RAG互动；"
+                f"本账号互动目标为 {interaction_target} 次"
+            )
+        else:
+            self.log.info(f"主动论文宣传发帖将在完成 {trigger_threshold} 次帖子互动后触发")
         return {
             "interaction_count": 0,
+            "interaction_target": interaction_target,
             "trigger_threshold": trigger_threshold,
             "attempted": False,
             "posted": False,
+            "paper_info": None,
+            "action_counts": {action: 0 for action in self.paper_agent.action_limits},
         }
 
     async def _generate_comment_text(self, text, character, language='英文'):
@@ -239,7 +253,15 @@ class TwitterAgent():
             "file_paths": paper_info.get("image_paths") or [],
         }
 
-    async def _publish_proactive_paper_post(self, bot, account_id, character, domain=None, paper_path=None):
+    async def _publish_proactive_paper_post(
+        self,
+        bot,
+        account_id,
+        character,
+        domain=None,
+        paper_path=None,
+        proactive_post_state=None,
+    ):
         post_payload = await self._build_proactive_paper_post(
             character=character,
             domain=domain,
@@ -247,15 +269,20 @@ class TwitterAgent():
         )
         if not post_payload:
             return False
+        if proactive_post_state is not None:
+            proactive_post_state["paper_info"] = post_payload["paper_info"]
 
         self.log.info(f"账号{account_id}达到主动发帖条件，开始宣传论文：{post_payload['paper_info'].get('Title')}")
         await self._sleep_for_phase("发布论文阅读日记前", 10, 25)
-        await bot.posts(
+        post_response = await bot.posts(
             account_id=int(account_id),
             content=post_payload["content"],
             file_paths=post_payload["file_paths"],
         )
         await self._sleep_for_phase("论文阅读日记发布完成", 20, 45)
+        if getattr(post_response, "status_code", None) != 200:
+            self.log.error(f"账号{account_id}论文阅读日记发布请求失败")
+            return False
         return True
 
     async def _register_interaction_and_maybe_post(self, bot, account_id, character, proactive_post_state, interaction_name, domain=None, paper_path=None):
@@ -265,10 +292,17 @@ class TwitterAgent():
         proactive_post_state["interaction_count"] += 1
         current_count = proactive_post_state["interaction_count"]
         trigger_threshold = proactive_post_state["trigger_threshold"]
-        self.log.info(
-            f"账号{account_id}完成第 {current_count} 次帖子互动（{interaction_name}），"
-            f"主动发帖阈值为 {trigger_threshold}"
-        )
+        interaction_target = proactive_post_state.get("interaction_target")
+        if interaction_target is not None:
+            self.log.info(
+                f"账号{account_id}完成第 {current_count} / {interaction_target} 次帖子互动"
+                f"（{interaction_name}），论文阅读日记仅发布一次"
+            )
+        else:
+            self.log.info(
+                f"账号{account_id}完成第 {current_count} 次帖子互动（{interaction_name}），"
+                f"主动发帖阈值为 {trigger_threshold}"
+            )
 
         if proactive_post_state["attempted"] or current_count < trigger_threshold:
             return False
@@ -280,8 +314,148 @@ class TwitterAgent():
             character=character,
             domain=domain,
             paper_path=paper_path,
+            proactive_post_state=proactive_post_state,
         )
         return proactive_post_state["posted"]
+
+    async def _evaluate_and_dispatch_paper_interaction(
+        self,
+        bot,
+        account_id,
+        character,
+        proactive_post_state,
+        post_info,
+        action_counts,
+        source_name,
+        domain=None,
+        paper_path=None,
+    ):
+        if not isinstance(post_info, dict) or not post_info.get("note_url") or not post_info.get("content"):
+            self.log.info(f"账号{account_id}跳过字段不完整的{source_name}候选帖子")
+            return False, False, None
+
+        # 新论文流程只以当前帖子为检索入口，不读取阅读日记的固定目标论文。
+        if not hasattr(self, "sensitive_filter"):
+            self.sensitive_filter = SensitivePersonFilter()
+        now = datetime.now(timezone.utc)
+        published = utc_time(post_info.get("post_time_ip"))
+        if not published or not now - timedelta(days=7) <= published <= now or self.sensitive_filter.blocked_post(post_info):
+            self.log.info(f"跳过过期、时间不明或涉及黑名单人物的帖子：{post_info.get('note_url')}")
+            return False, False, None
+        match = re.fullmatch(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)/?", post_info["note_url"], re.IGNORECASE)
+        if not match:
+            return False, False, None
+        url = f"https://x.com/{match.group(1)}/status/{match.group(2)}"
+        seen = proactive_post_state.setdefault("interacted_posts", set())
+        if url in seen:
+            return False, False, None
+        # URL已严格校验；同时匹配旧twitter域名记录，避免升级后重复互动。
+        old_url = url.replace("https://x.com/", "https://twitter.com/")
+        existing = self.database.get_dict_data_sql(
+            f"SELECT 1 FROM twitter_interaction WHERE Account_id={int(account_id)} "
+            f"AND URL IN ('{url}', '{old_url}') "
+            "AND Action IN ('点赞','评论','转发','仅评论') LIMIT 1"
+        )
+        if existing:
+            self.log.info(f"账号{account_id}已互动过帖子{url}，跳过")
+            return False, False, None
+        if not hasattr(self, "recommendation_service"):
+            self.recommendation_service = PostRecommendationService(log=self.log)
+        recommendation = await self.recommendation_service.recommend(
+            post_info, character, domain, self.paper_agent.max_length,
+        )
+        if not recommendation:
+            return False, False, None
+        candidates = ["点赞", "评论"] if recommendation.strategy == "只互动" else ["评论", "转发"]
+        candidates = [action for action in candidates if action_counts.get(action, 0) < self.paper_agent.action_limits[action]]
+        if not candidates:
+            exhausted = all(action_counts.get(action, 0) >= self.paper_agent.action_limits[action] for action in ("点赞", "评论", "转发"))
+            return False, exhausted, None
+        action = random.choice(candidates)
+        self.log.info(f"账号{account_id}策略={recommendation.strategy}，动作={action}，帖子={url}")
+        await self._sleep_for_phase(f"账号{account_id}执行{action}前", 3, 10)
+        try:
+            if action == "点赞":
+                response = await bot.likes(account_id=int(account_id), url=url, report_existing=True)
+            elif action == "评论":
+                response = await bot.comments(account_id=int(account_id), url=url, content=recommendation.content, file_paths=[])
+            else:
+                response = await bot.transmits(account_id=int(account_id), url=url, content=recommendation.content, file_paths=[])
+            payload = json.loads(response.body.decode())
+            succeeded = response.status_code == 200 and payload.get("message") == "success" and str(payload.get("code")) == "200"
+        except Exception as error:
+            self.log.warning(f"帖子{url}互动执行失败，不计入额度：{error}")
+            return False, False, None
+        if not succeeded:
+            self.log.info(f"帖子{url}互动失败或已经完成，不计入额度")
+            return False, False, None
+        seen.add(url)
+        action_counts[action] = action_counts.get(action, 0) + 1
+        result = {"post_url": url, "action": action, "strategy": recommendation.strategy,
+                  "paper_ids": [paper["paper_id"] for paper in recommendation.papers]}
+        await self._register_interaction_and_maybe_post(
+            bot=bot,
+            account_id=int(account_id),
+            character=character,
+            proactive_post_state=proactive_post_state,
+            interaction_name=f"{source_name}-{action}",
+            domain=domain,
+            paper_path=paper_path,
+        )
+        return True, False, result
+
+    async def _interact_with_paper_target_posts(
+        self,
+        bot,
+        account_id,
+        character,
+        target_informations,
+        proactive_post_state,
+        domain=None,
+        paper_path=None,
+    ):
+        if not target_informations:
+            self.log.info(f"账号{account_id}没有可互动的大V候选帖子，本轮结束")
+            return []
+
+        normalized_domain = domain or "Large Language Models for Recommendation"
+        action_counts = (proactive_post_state or {}).setdefault(
+            "action_counts",
+            {action: 0 for action in self.paper_agent.action_limits},
+        )
+        interaction_results = []
+        interaction_target = (proactive_post_state or {}).get("interaction_target") or random.randint(10, 15)
+        completed_interactions = (proactive_post_state or {}).get("interaction_count", 0)
+        max_interactions = max(0, interaction_target - completed_interactions)
+
+        self.log.info(
+            f"账号{account_id}开始筛选 {len(target_informations)} 条大V候选帖子，"
+            f"本阶段最多互动 {max_interactions} 次"
+        )
+        for post_info in target_informations:
+            if len(interaction_results) >= max_interactions:
+                break
+            performed, should_stop, result = await self._evaluate_and_dispatch_paper_interaction(
+                bot=bot,
+                account_id=int(account_id),
+                character=character,
+                proactive_post_state=proactive_post_state,
+                post_info=post_info,
+                action_counts=action_counts,
+                source_name="大V",
+                domain=normalized_domain,
+                paper_path=paper_path,
+            )
+            if should_stop:
+                break
+            if performed:
+                interaction_results.append(result)
+                await self._sleep_for_phase(f"账号{account_id}完成一次大V帖子互动", 6, 15)
+
+        self.log.info(
+            f"账号{account_id}大V候选帖子筛选完成，共执行 {len(interaction_results)} 次互动"
+        )
+        return interaction_results
 
     async def _interact_with_target_posts(
         self,
@@ -569,7 +743,7 @@ class TwitterAgent():
                     #     character = None
                     planner = TwitterPlanner(log_path=f"./logs/twitter/{account_ids[0]}/twitter_log.log")
                     topics_informations,news_information,other_information = [],[],[]
-                    if topic_path:
+                    if topic_path and not paper_mode:
                         # 星云大师账号，从话题池中获取话题
                         topics_informations = await planner.get_topics_information(topic_path=topic_path)
                         # self.log.info(f'对于账户{account_dict}获取到的佛学话题为：{topics_informations}')
@@ -577,10 +751,14 @@ class TwitterAgent():
                         # news_information, other_information = await planner.get_interested_information(account_id=int(account_ids[0]),news=news,followings=followings,url=url,characters=character)
                         # self.log.info(f'''对于账户{account_dict}获取到的感兴趣的新闻内容为：{news_information}''')
                         # self.log.info(f'''对于账户{account_dict}获取到的感兴趣的其他内容为：{other_information}''')
-                        await self._sleep_for_phase("开始搜索新闻和相关帖子前", 8, 18)
-                        all_inforamtion = await planner.get_all_informations(account_id=int(account_ids[0]),news=news,followings=followings,url=url)
-                        await self._sleep_for_phase("新闻和相关帖子搜索完成", 5, 12)
-                        self.log.info(f'''对于账户{account_dict}获取到的信息是：{all_inforamtion}''')
+                        if paper_mode:
+                            all_inforamtion = []
+                            self.log.info("论文模式按新顺序执行，跳过大V互动前的热搜帖子搜索")
+                        else:
+                            await self._sleep_for_phase("开始搜索新闻和相关帖子前", 8, 18)
+                            all_inforamtion = await planner.get_all_informations(account_id=int(account_ids[0]),news=news,followings=followings,url=url)
+                            await self._sleep_for_phase("新闻和相关帖子搜索完成", 5, 12)
+                            self.log.info(f'''对于账户{account_dict}获取到的信息是：{all_inforamtion}''')
                     
                     for time_key,ids in account_dict.items():
                         while True:
@@ -637,28 +815,65 @@ class TwitterAgent():
                                 time.sleep(random.uniform(30,60))
                                 # 更新账号的user profile
                                 await bot.get_user_profile(account_id=int(account))
-                                proactive_post_state = self._new_proactive_post_state()
+                                proactive_post_state = self._new_proactive_post_state(post_first=paper_mode)
                                 if paper_mode:
                                     self.log.info(f'账号{account}先发布论文阅读日记，再执行互动')
                                     proactive_post_state["attempted"] = True
-                                    proactive_post_state["posted"] = await self._publish_proactive_paper_post(
+                                    try:
+                                        proactive_post_state["posted"] = await self._publish_proactive_paper_post(
+                                            bot=bot,
+                                            account_id=int(account),
+                                            character=character,
+                                            domain=domain,
+                                            paper_path=paper_path,
+                                            proactive_post_state=proactive_post_state,
+                                        )
+                                    except Exception as error:
+                                        # 阅读日记与帖子RAG解耦，日记失败不阻塞本轮名单互动。
+                                        self.log.warning(f"账号{account}论文阅读日记失败，继续名单互动：{error}")
+                                bot.scroll(duration=random.uniform(10,20))
+                                target_persons_path = None
+                                if paper_mode:
+                                    target_persons_path = os.environ.get(
+                                        "TWITTER_OBJECT_PERSONS_PATH",
+                                        os.path.join(os.path.dirname(pythonpath), "twitter_object_persons.txt"),
+                                    )
+                                    self.log.info(
+                                        f'账号{account}从大V人物文件搜索近期帖子：{target_persons_path}'
+                                    )
+                                else:
+                                    self.log.info(f'获取账号{account}关注的目标人物的五天之内的帖子')
+                                try:
+                                    await self._sleep_for_phase(f"账号{account}搜索大V帖子前", 3, 5)
+                                    if paper_mode:
+                                        target_informations = await planner.get_paper_target_information(
+                                            account_id=int(account), bot=bot, target_path=target_persons_path,
+                                        )
+                                    else:
+                                        target_informations = await planner.get_target_information(
+                                            account_id=int(account), bot=bot, sample_size=5, posts_per_target=3,
+                                        )
+                                    await self._sleep_for_phase(f"账号{account}大V帖子搜索完成", 5, 12)
+                                    self.log.info(
+                                        f'账号{account}共获取 {len(target_informations)} 条大V候选帖子'
+                                    )
+                                    bot.scroll(duration=random.uniform(10,18))
+                                except Exception as e:
+                                    self.log.error(f'获取账号{account}的大V候选帖子失败，错误信息：{e}')
+                                    target_informations = []
+                                if paper_mode:
+                                    await self._interact_with_paper_target_posts(
                                         bot=bot,
                                         account_id=int(account),
                                         character=character,
+                                        target_informations=target_informations,
+                                        proactive_post_state=proactive_post_state,
                                         domain=domain,
                                         paper_path=paper_path,
                                     )
-                                bot.scroll(duration=random.uniform(10,20))
-                                self.log.info(f'获取账号{account}关注的目标人物的五天之内的帖子')
-                                try:
-                                    await self._sleep_for_phase(f"账号{account}搜索关注列表大V帖子前", 8, 18)
-                                    target_informations = await planner.get_target_information(account_id=int(account),bot=bot)
-                                    await self._sleep_for_phase(f"账号{account}关注列表大V帖子搜索完成", 5, 12)
-                                    self.log.info(f'''对于账户{account}获取到的目标人物近五天的帖子信息是：{target_informations}''') 
-                                    bot.scroll(duration=random.uniform(10,18))
-                                except Exception as e:
-                                    self.log.error(f'获取账号{account}关注的目标人物的帖子失败，错误信息：{e}')
-                                    target_informations = []
+                                    bot.scroll(duration=random.uniform(10,20))
+                                    bot.driver.driver.quit()
+                                    continue
                                 await self._interact_with_target_posts(
                                     bot=bot,
                                     account_id=int(account),
@@ -935,7 +1150,7 @@ if __name__ == '__main__':
     parser.add_argument("--followings", action="store_true", default=True, help="抓取关注列表素材")
     parser.add_argument("--no-followings", action="store_false", dest="followings", help="不抓取关注列表素材")
     parser.add_argument("--topic-path", default=os.environ.get("TWITTER_TOPIC_PATH", "./data/xingyundashi_topic.json"), help="话题池路径")
-    parser.add_argument("--paper-mode", action="store_true", help="启用论文推荐模式，复用 paper_agent 的论文宣传流程")
+    parser.add_argument("--paper-mode", action="store_true", help="启用名单大V近期帖的RAG论文推荐模式")
     parser.add_argument("--domain", default=os.environ.get("TWITTER_DOMAIN", "Large Language Models for Recommendation"), help="论文领域")
     parser.add_argument("--paper-path", default=os.environ.get("TWITTER_PAPER_PATH"), help="本地论文 zip 目录")
     parser.add_argument("--max-cycles", type=int, default=None, help="最多运行多少轮后自动退出")

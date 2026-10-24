@@ -2,6 +2,7 @@ import json
 import os
 import random
 import shutil
+import socket
 import sys
 import time
 
@@ -24,6 +25,35 @@ from utils.proxy import create_proxyauth_extension, get_ip_port
 
 class WebDriver:
     """Selenium browser wrapper used by the project."""
+
+    @staticmethod
+    def environment_flag(name: str, default: bool = False) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+    @staticmethod
+    def proxy_is_available(host: str, port, timeout: float = 1.5) -> bool:
+        if not host or not port:
+            return False
+        try:
+            with socket.create_connection((str(host).strip(), int(port)), timeout=timeout):
+                return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _is_profile_startup_error(error: Exception) -> bool:
+        error_text = str(error).lower()
+        return any(
+            marker in error_text
+            for marker in (
+                "devtoolsactiveport file doesn't exist",
+                "chrome failed to start",
+                "user data directory is already in use",
+            )
+        )
 
     @staticmethod
     def _infer_platform_from_user_agent(user_agent: str) -> str:
@@ -62,6 +92,7 @@ class WebDriver:
             "SingletonSocket",
             "SingletonCookie",
             "DevToolsActivePort",
+            "lockfile",
         }
         for entry_name in stale_entries:
             entry_path = os.path.join(profile_path, entry_name)
@@ -160,27 +191,69 @@ class WebDriver:
         self.log = logger(filename=log_path)
         self.cookies = None
         self.fingerprint = self._normalize_fingerprint(fingerprint)
+        self.last_navigation_error = ""
+        self.proxy_fallback_direct = self.environment_flag("PROXY_FALLBACK_DIRECT", True)
+        self.use_proxy = bool(use_proxy)
+        self.profile_fallback_used = False
+        self.failed_profile_path = None
+
+        if self.use_proxy:
+            proxy_host = MIMN_IP.get("IP")
+            proxy_port = MIMN_IP.get("PORT")
+            self.log.info(f"请求使用浏览器代理：http://{proxy_host}:{proxy_port}")
+            if not self.proxy_is_available(proxy_host, proxy_port):
+                if self.proxy_fallback_direct:
+                    self.use_proxy = False
+                    self.log.error(
+                        f"浏览器代理不可用：http://{proxy_host}:{proxy_port}，已自动回退为直连模式"
+                    )
+                else:
+                    self.log.error(
+                        f"浏览器代理不可用：http://{proxy_host}:{proxy_port}，"
+                        "PROXY_FALLBACK_DIRECT=0，继续尝试代理模式"
+                    )
 
         profile_path = self.fingerprint.get("profile_path") if self.fingerprint else None
         if profile_path:
             self._cleanup_profile_artifacts(profile_path, log=self.log)
 
-        chrome_options = self.get_chrome_options(
-            fingerprint=self.fingerprint,
-            headless=headless,
-            ip=ip,
-            username=username,
-            password=password,
-            use_proxy=use_proxy
-        )
-
-        if driver_path and os.path.isfile(driver_path):
-            service = Service(driver_path)
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            self.log.info(f"Using configured chromedriver: {driver_path}")
-        else:
-            self.driver = webdriver.Chrome(options=chrome_options)
+        def start_chrome():
+            chrome_options = self.get_chrome_options(
+                fingerprint=self.fingerprint,
+                headless=headless,
+                ip=ip,
+                username=username,
+                password=password,
+                use_proxy=self.use_proxy,
+            )
+            if driver_path and os.path.isfile(driver_path):
+                driver = webdriver.Chrome(service=Service(driver_path), options=chrome_options)
+                self.log.info(f"Using configured chromedriver: {driver_path}")
+                return driver
+            driver = webdriver.Chrome(options=chrome_options)
             self.log.info("Configured chromedriver path not found, falling back to Selenium Manager")
+            return driver
+
+        try:
+            self.driver = start_chrome()
+        except WebDriverException as startup_error:
+            if (
+                profile_path
+                and self.environment_flag("CHROME_PROFILE_FALLBACK", True)
+                and self._is_profile_startup_error(startup_error)
+            ):
+                self.profile_fallback_used = True
+                self.failed_profile_path = profile_path
+                self.fingerprint = dict(self.fingerprint)
+                self.fingerprint.pop("profile_path", None)
+                self.log.error(
+                    f"Chrome 使用账号配置目录启动失败：{profile_path}，"
+                    "将保留其余浏览器指纹并改用临时配置目录重试一次"
+                )
+                self.driver = start_chrome()
+                self.log.info("Chrome 已使用临时配置目录启动成功，可继续执行 Cookie 登录")
+            else:
+                raise
 
         if headless:
             self.driver.set_window_size(1920, 1080)
@@ -243,6 +316,7 @@ class WebDriver:
             return False
 
     def _login(self, url: str = "https://weibo.com", cookies: list = None, token: str = None):
+        self.last_navigation_error = ""
         try:
             self.driver.set_page_load_timeout(45)
             self.driver.get(url=url)
@@ -268,6 +342,7 @@ class WebDriver:
                 time.sleep(2)
             return True
         except TimeoutException as e:
+            self.last_navigation_error = str(e)
             try:
                 self.driver.execute_script("window.stop();")
             except Exception:
@@ -276,10 +351,12 @@ class WebDriver:
             self.log.error("cookies load failed")
             return False
         except WebDriverException as e:
+            self.last_navigation_error = str(e)
             self.log.error(str(e))
             self.log.error("cookies load failed")
             return False
         except Exception as e:
+            self.last_navigation_error = str(e)
             self.log.error(str(e))
             self.log.error("cookies load failed")
             return False
@@ -291,7 +368,12 @@ class WebDriver:
         self.driver.quit()
 
     def get(self, url):
-        self.driver.get(url)
+        self.last_navigation_error = ""
+        try:
+            self.driver.get(url)
+        except Exception as e:
+            self.last_navigation_error = str(e)
+            raise
 
     def find_xpath(self, XPATH: str = None):
         return self.driver.find_element(By.XPATH, XPATH)

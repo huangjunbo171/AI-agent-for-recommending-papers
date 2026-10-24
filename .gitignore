@@ -3,6 +3,11 @@ paper_agent/config.py
 .env
 .env.*
 
+# Local account lists and browser fingerprints
+twitter_object_persons.txt
+twitter_object_persons.txt.bak.*
+data/account_fingerprints.json
+
 # Runtime outputs
 logs/
 information/

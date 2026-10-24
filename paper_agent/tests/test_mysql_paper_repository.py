@@ -91,6 +91,31 @@ def _paper() -> Paper:
 class MySQLPaperRepositoryTest(unittest.TestCase):
     """验证论文派生字段只写入 papers 库中的目标表。"""
 
+    def test_load_by_ids_uses_parameters_and_preserves_retrieval_order(self):
+        repository = MySQLPaperRepository()
+        connection = _FakeConnection()
+        repository.connect = lambda: connection
+        template = dict(paper_id=1, source_id="2610.00001", title="Title", authors='["Alice"]',
+                        abstract="Abstract", categories='["cs.AI"]', published_at=datetime(2026, 10, 24),
+                        raw_metadata="{}", paper_url="https://arxiv.org/abs/2610.00001", pdf_url="https://arxiv.org/pdf/2610.00001",
+                        doi=None, venue=None, is_code_open_source="unknown", is_code_open=None, code_url=None,
+                        keywords='["retrieval"]', research_topics='["AI"]', core_method="Retrieve evidence",
+                        datasets="[]", main_contributions='["A method"]', main_results="[]", limitations="[]")
+        connection.fake_cursor.fetchall = lambda: [template, dict(template, paper_id=3)]
+        papers = repository.load_by_ids([3, 2, 1, 3])
+        self.assertEqual([3, 1], [paper.paper_id for paper in papers])
+        self.assertEqual(["A method"], papers[0].analysis["main_contributions"])
+        sql, parameters = connection.fake_cursor.statements[0]
+        self.assertIn("IN (%s,%s,%s)", sql)
+        self.assertEqual([3, 2, 1], parameters)
+        self.assertTrue(connection.closed)
+        self.assertFalse(connection.committed)
+
+    def test_empty_load_by_ids_does_not_connect(self):
+        repository = MySQLPaperRepository()
+        repository.connect = lambda: self.fail("空ID列表不应连接数据库")
+        self.assertEqual([], repository.load_by_ids([]))
+
     def test_analysis_only_update_does_not_touch_source(self):
         """验证重分析更新主表派生字段且不修改来源表。"""
         repository = MySQLPaperRepository()
