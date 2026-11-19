@@ -2,6 +2,16 @@
 
 本项目面向论文推荐场景构建社交媒体智能体。系统可以从论文库或本地论文压缩包中提取论文信息，根据账号人设筛选相关帖子，并在 X/Twitter 上完成论文阅读日记发布、关注列表互动和相关帖子推荐回复。
 
+## 代码概览
+
+项目包含论文入库和 X 论文推荐两条流程。入库流程准备论文详情和向量索引，推荐流程用它们生成论文日记和帖子回复。
+
+1. **论文入库**。从 arXiv 获取论文，通过 MinerU 解析 PDF，由 DeepSeek 分析正文。论文详情写入 MySQL，标题和摘要的向量写入 LanceDB。[入库入口](paper_agent/paper_agent/arxiv_ingest.py) · [向量库接口](paper_agent/utils/lancedb_store.py)
+2. **账号登录与论文日记**。串行入口依次处理指定账号，通过浏览器使用 Cookie 登录 X，再按账号人设选取候选论文，尝试发布附有论文链接的阅读日记。[串行入口](paper_agent/twitter_agent/twitter_agent_serial.py) · [浏览器操作](paper_agent/twitter_agent/twitter_bot.py)
+3. **帖子筛选与推荐**。程序从名单获取近期帖子，按帖子内容和账号人设选择互动方式。需要推荐论文时，先按帖子内容从 LanceDB 召回候选，再读取 MySQL 中的论文详情，由模型筛选并生成回复。[名单与帖子过滤](paper_agent/utils/twitter_targets.py) · [论文推荐模块](paper_agent/utils/paper_recommender.py) · [提示词](paper_agent/paper_agent/prompts_test.py)
+
+论文模式使用 `--paper-mode`。运行参数和单轮示例见[串行流程运行说明](#如何运行更新后的串行流程)。
+
 ## arXiv 论文基础入库链路
 
 `paper_agent/paper_agent/arxiv_ingest.py` 会按提交时间抓取 arXiv 指定分类的最新英文论文，下载 PDF 后由 MinerU 生成 `full.md`，并从中确定标题和摘要。程序会先按 Markdown 章节删除 Related Work 及其子章节，并从 References 或 Bibliography 开始截断，再把清理后的正文提交给 DeepSeek。标题、作者、分类和摘要只作为辅助元数据；程序不会退回到仅根据摘要分析。`core_method` 会生成 300～600 个英文词的详细方法说明，覆盖方法流程、关键模块、训练或推理过程、目标函数和核心创新，但不会补写正文没有的信息。
