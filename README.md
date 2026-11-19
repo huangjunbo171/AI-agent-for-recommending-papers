@@ -4,13 +4,15 @@
 
 ## 代码概览
 
-项目包含论文入库和 X 论文推荐两条流程。入库流程准备论文详情和向量索引，推荐流程用它们生成论文日记和帖子回复。
+**研究动机。** 研究者在 X 上讨论论文时，往往是从一个具体问题出发，比如推荐系统给出的解释能否帮助用户理解推荐结果。这个项目关注的是，Agent 如何根据原帖的讨论判断是否适合推荐论文，并指出论文中与问题相关的方法、发现或局限。
 
-1. **论文入库**。从 arXiv 获取论文，通过 MinerU 解析 PDF，由 DeepSeek 分析正文。论文详情写入 MySQL，标题和摘要的向量写入 LanceDB。[入库入口](paper_agent/paper_agent/arxiv_ingest.py) · [向量库接口](paper_agent/utils/lancedb_store.py)
-2. **账号登录与论文日记**。串行入口依次处理指定账号，通过浏览器使用 Cookie 登录 X，再按账号人设选取候选论文，尝试发布附有论文链接的阅读日记。[串行入口](paper_agent/twitter_agent/twitter_agent_serial.py) · [浏览器操作](paper_agent/twitter_agent/twitter_bot.py)
-3. **帖子筛选与推荐**。程序从名单获取近期帖子，按帖子内容和账号人设选择互动方式。需要推荐论文时，先按帖子内容从 LanceDB 召回候选，再读取 MySQL 中的论文详情，由模型筛选并生成回复。[名单与帖子过滤](paper_agent/utils/twitter_targets.py) · [论文推荐模块](paper_agent/utils/paper_recommender.py) · [提示词](paper_agent/paper_agent/prompts_test.py)
+**论文数据的准备。** 程序从 arXiv 获取论文，用 MinerU 解析 PDF，再由 DeepSeek 分析正文。论文详情存入 MySQL，标题和摘要的向量存入 LanceDB。[论文入库入口](paper_agent/paper_agent/arxiv_ingest.py) · [向量库接口](paper_agent/utils/lancedb_store.py)
 
-论文模式使用 `--paper-mode`。运行参数和单轮示例见[串行流程运行说明](#如何运行更新后的串行流程)。
+**围绕账号人设发布阅读日记。** 一轮任务会依次处理指定的 X 账号。登录后，Agent 根据账号关注的研究方向选取论文，并围绕论文中的一个具体观察撰写阅读日记，附上原文链接。[串行入口](paper_agent/twitter_agent/twitter_agent_serial.py) · [浏览器操作](paper_agent/twitter_agent/twitter_bot.py)
+
+**结合原帖选择互动方式。** 程序从目标账号名单中获取近期帖子，结合帖子内容和账号人设判断如何回应。适合交流的帖子可以只点赞或评论。需要推荐时，Agent 以原帖为查询召回论文，再从论文详情中选择和当前讨论相关的信息，用于生成回复。[目标筛选](paper_agent/utils/twitter_targets.py) · [论文推荐模块](paper_agent/utils/paper_recommender.py) · [提示词](paper_agent/paper_agent/prompts_test.py)
+
+论文模式使用 `--paper-mode`。具体参数和单轮运行示例见[串行流程运行说明](#如何运行更新后的串行流程)。
 
 ## arXiv 论文基础入库链路
 
@@ -179,37 +181,39 @@ print(store.validate_schema())
 
 ## 如何运行更新后的串行流程
 
-下面的命令会让账号 `1` 和 `224` 立即各运行一轮论文模式。该命令会登录真实账号，并可能实际发帖、点赞、评论或转发，运行前应先确认账号、Cookie、论文目录和模型配置正确。
+### 运行前的准备
+
+下面的步骤以 GitHub `main` 分支为准。在 Windows PowerShell 中进入仓库根目录。以下命令使用已配置的 Python 环境和 Chrome。
+
+1. **准备 Python 和浏览器。** 推荐入口使用 Selenium、PyMySQL、LanceDB 等 Python 依赖，并通过 Selenium 驱动 Chrome。若需要指定 ChromeDriver，可设置 `DEFAULT_DRIVER_PATH`。通过本机代理访问 X 时，把 `MIMN_IP`、`MIMN_PORT` 设置为实际代理地址和端口。
+2. **准备账号和论文数据。** `twitter` 库需要存在配置好的账号及有效 Cookie，`papers` 库保存论文详情，LanceDB 的 `paper_embeddings` 保存论文向量。如果需要准备论文和索引，可以先运行上面的 [arXiv 论文入库流程](#arxiv-论文基础入库链路)。
+3. **填写配置和目标名单。** 首次运行时，将 `paper_agent/config.example.py` 复制为 `paper_agent/config.py`。在运行环境中配置 `DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、`DEEPSEEK_API_KEY` 和 `DASHSCOPE_API_KEY`，并根据实际目录设置 `LANCEDB_PAPERS_PATH`。参考示例创建 `twitter_object_persons.txt`，按每行一个“主页链接, 姓名”填入目标账号。Cookie 由账号库提供，模型密钥通过环境变量加载。[配置示例](paper_agent/config.example.py) · [目标名单示例](twitter_object_persons.example.txt)
+
+### 执行一轮
+
+先用配置模板初始化本地配置，再查看帮助，确认入口能够加载。`PYTHONPATH` 指向仓库根目录，便于入口导入 `update_characters` 等模块。
 
 ```powershell
-python paper_agent\twitter_agent\twitter_agent_serial.py `
-  --account-ids 1,224 `
-  --paper-mode `
-  --force-run-now `
-  --llm-provider deepseek `
-  --max-cycles 1
+if (-not (Test-Path .\paper_agent\config.py)) {
+    Copy-Item .\paper_agent\config.example.py .\paper_agent\config.py
+}
+$env:PYTHONPATH = (Get-Location).Path
+python .\paper_agent\twitter_agent\twitter_agent_serial.py --help
 ```
 
-如果论文不在默认目录，可以显式指定研究领域和本地论文目录：
+确认账号和模型配置后，执行下面的命令。程序会按输入顺序使用指定账号访问 X，每个账号运行一轮。该命令可能实际发帖、点赞、评论或转发。
 
 ```powershell
-python paper_agent\twitter_agent\twitter_agent_serial.py `
-  --account-ids 1,224 `
-  --paper-mode `
-  --force-run-now `
-  --domain "Large Language Models for Recommendation" `
-  --paper-path ".\papers\zip_folder" `
-  --llm-provider deepseek `
-  --max-cycles 1
+$accountIds = (Read-Host '输入账号 ID，多个 ID 用逗号分隔').Trim()
+if ($accountIds -notmatch '^\d+(,\d+)*$') { throw '账号 ID 格式无效' }
+python .\paper_agent\twitter_agent\twitter_agent_serial.py --account-ids $accountIds --paper-mode --force-run-now --llm-provider deepseek --max-cycles 1
 ```
 
-调试等待节奏时，可以先在当前 PowerShell 会话中设置缩放系数：
+`--force-run-now` 跳过排班等待，`--max-cycles 1` 将每个账号限制为一轮。当前 `main` 的日记会从本地论文材料选题，可以将 ZIP 放到 `papers/zip_folder/`，或用 `--paper-path` 指定 ZIP 文件或已解压的论文目录。帖子推荐仍使用 MySQL 和 LanceDB 中的论文数据。
 
-```powershell
-$env:TWITTER_SLEEP_SCALE = "0.5"
-```
+### 查看运行结果
 
-常用参数包括 `--account-ids`、`--paper-mode`、`--domain`、`--paper-path`、`--force-run-now`、`--max-cycles` 和 `--max-runtime-minutes`。`--followings` 默认启用；若明确不需要关注列表素材，可以使用 `--no-followings`。模型密钥建议通过对应环境变量提供，例如 `DEEPSEEK_API_KEY` 或 `CHATGPT_API_KEY`，不要写入代码或提交到版本库。
+总日志位于 `logs/twitter/twitter_log.log`，每个账号的日志位于 `logs/twitter/<账号ID>/twitter_log.log`。检查账号是否登录、是否获取了候选帖子以及选择了哪种互动策略。确认日记发布时，可以用程序返回的帖子链接打开对应帖子。单轮任务结束后会退出。运行日志可能包含账号信息，分享前应去除凭据。
 
 ## 历史更新
 
